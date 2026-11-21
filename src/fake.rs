@@ -17,6 +17,8 @@ struct State {
     providers: Vec<Value>,
     launched: Vec<Value>,
     organized: Vec<Value>,
+    configured: Vec<Value>,
+    forks: u64,
     sent: Vec<Value>,
     calls: Vec<String>,
     send_fails: bool,
@@ -238,6 +240,14 @@ impl FakeT3 {
         self.st().sent.clone()
     }
 
+    pub fn configured(&self) -> Vec<Value> {
+        self.st().configured.clone()
+    }
+
+    pub fn thread(&self, id: &str) -> Option<Value> {
+        self.st().threads.get(id).cloned()
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.st().calls.clone()
     }
@@ -353,6 +363,36 @@ impl FakeT3 {
                 st.threads.insert(id.clone(), th);
                 Ok(json!({"threadId": id, "link": format!("https://t3/{id}"), "projectId": args["projectId"],
                           "modelSelection": args["modelSelection"], "runId": format!("run:{id}:1"), "status": "running"}))
+            }
+            "t3_thread_transfer" if args["action"] == "fork" => {
+                let id = args["threadId"].as_str().unwrap_or_default();
+                let Some(src) = st.threads.get(id).cloned() else {
+                    return Err(T3Error::Tool(format!("t3_thread_transfer: thread {id} not found")));
+                };
+                st.forks += 1;
+                let new = format!("fork:{}", st.forks);
+                let mut th = thread(&new, "idle", "2026-11-17T12:00:00Z");
+                for k in ["providerInstanceId", "model", "projectId", "branch", "worktreePath"] {
+                    th[k] = src[k].clone();
+                }
+                th["title"] = args.get("title").cloned().unwrap_or_else(|| src["title"].clone());
+                th["latestRunId"] = Value::Null;
+                th["forkedFrom"] = json!(id);
+                st.threads.insert(new.clone(), th);
+                Ok(json!({"sequence": st.forks, "targetThreadId": new}))
+            }
+            "t3_thread_configure" => {
+                let id = args["threadId"].as_str().unwrap_or_default().to_string();
+                st.configured.push(args.clone());
+                let Some(th) = st.threads.get_mut(&id) else {
+                    return Err(T3Error::Tool(format!("t3_thread_configure: thread {id} not found")));
+                };
+                let m = &args["modelSelection"];
+                if m.is_object() {
+                    th["providerInstanceId"] = m["instanceId"].clone();
+                    th["model"] = m["model"].clone();
+                }
+                Ok(json!({"sequence": 1}))
             }
             "t3_thread_organize" => {
                 if st.organize_fails {

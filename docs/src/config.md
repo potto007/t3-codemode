@@ -265,8 +265,24 @@ mixed pool, a call that names any model or effort fails, even one that matches
 a member's. Skills pick from a pool with [`wf.pick`](globals.md#wf).
 The workflow skills do that for each launch when their `model worker` or
 `model ticket` slot names a pool, as `"worker": {"pool": "opus"}`; see
-[A pool on a model line](https://github.com/OttoOps/t3-codemode/blob/main/skills/t3-workflow/slots.md#a-pool-on-a-model-line).
+[A pool on a model slot](https://github.com/OttoOps/t3-codemode/blob/main/skills/t3-workflow/slots.md#a-pool-on-a-model-slot).
 Pools are per T3 environment, since instance ids belong to one T3 server.
+
+#### Moving a limited thread
+
+When a thread that a pool launched stops on a usage limit, the watcher pass
+puts one card on the board: reply `move` to move the thread to a ready member
+of its pool, or `wait` to leave it until the reset. In a mixed pool, a move
+considers only the members of the thread's own driver. A move forks the thread
+with its context and worktree, switches the fork to the new member, moves the
+thread's workflow links to the fork, resumes the fork, and settles the old
+thread. The pick history and the feed record the move.
+
+The card goes only to a thread with a recorded pick: a ticket the board
+launched, or a launch reported with [`wf.picked`](globals.md#wf). A thread
+launched straight on an instance never gets one, and neither does a board
+question. A thread that runs again before the answer
+loses its card, and a move refuses a thread that is running.
 
 ### Updates
 

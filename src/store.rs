@@ -239,6 +239,8 @@ pub struct PickRecord {
     pub handle: Option<String>,
     #[serde(default)]
     pub thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -844,6 +846,105 @@ impl Store {
         })
     }
 
+    pub fn rebind(&self, old: &str, new: &str, link: Option<&str>, board: &str, at: &str) -> Result<bool> {
+        fn read<T: serde::de::DeserializeOwned>(
+            tx: &rusqlite::Transaction,
+            sql: &str,
+            p: impl rusqlite::Params,
+        ) -> Result<Vec<(i64, T)>> {
+            let mut st = tx.prepare(sql)?;
+            let rows: Vec<(i64, String)> =
+                st.query_map(p, |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            rows.into_iter().map(|(k, d)| Ok((k, serde_json::from_str(&d)?))).collect()
+        }
+        fn save(tx: &rusqlite::Transaction, ln: &Link) -> Result<()> {
+            tx.execute(
+                "INSERT INTO links (child, parent, closed, data) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (child) DO UPDATE SET parent = excluded.parent, closed = excluded.closed, data = excluded.data",
+                params![ln.child, ln.parent, ln.closed as i64, serde_json::to_string(ln)?],
+            )?;
+            Ok(())
+        }
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut rebound = false;
+        let own: Vec<(i64, Link)> = read(&tx, "SELECT rowid, data FROM links WHERE child = ?1 AND closed = 0", [old])?;
+        if let Some((_, ln)) = own.into_iter().next() {
+            let moved = Link {
+                child: new.into(),
+                link: link.map(String::from).or(ln.link.clone()),
+                last_nudge: None,
+                nudges: 0,
+                escalated: false,
+                bad_run: None,
+                settled_at: None,
+                ..ln
+            };
+            tx.execute("DELETE FROM links WHERE child = ?1", [old])?;
+            save(&tx, &moved)?;
+            rebound = true;
+        }
+        let children: Vec<(i64, Link)> =
+            read(&tx, "SELECT rowid, data FROM links WHERE parent = ?1 AND closed = 0", [old])?;
+        for (_, mut ln) in children {
+            ln.parent = new.into();
+            save(&tx, &ln)?;
+            rebound = true;
+        }
+        tx.execute(
+            "INSERT INTO nodes (thread, role, at) SELECT ?2, role, ?3 FROM nodes WHERE thread = ?1
+             ON CONFLICT (thread) DO UPDATE SET role = excluded.role, at = excluded.at",
+            params![old, new, at],
+        )?;
+        let pending: Vec<(i64, Pending)> = read(&tx, "SELECT rowid, data FROM pending", [])?;
+        for (_, p) in pending {
+            let mut q = p.clone();
+            if q.parent == old {
+                q.parent = new.into();
+            }
+            if q.thread.as_deref() == Some(old) {
+                q.thread = Some(new.into());
+                q.link = link.map(String::from).or(q.link);
+                rebound = true;
+            }
+            if q != p {
+                tx.execute("DELETE FROM pending WHERE parent = ?1 AND label = ?2", params![p.parent, p.label])?;
+                tx.execute(
+                    "INSERT INTO pending (parent, label, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (parent, label) DO UPDATE SET data = excluded.data",
+                    params![q.parent, q.label, serde_json::to_string(&q)?],
+                )?;
+            }
+        }
+        let cards: Vec<(i64, Value)> = read(
+            &tx,
+            "SELECT seq, data FROM waiting WHERE owner = ?1 AND resolved_at IS NULL AND data IS NOT NULL",
+            [board],
+        )?;
+        for (seq, mut d) in cards.into_iter().filter(|(_, d)| d["ticket"] == old && d["move"].is_null()) {
+            d["ticket"] = Value::from(new);
+            tx.execute(
+                "UPDATE waiting SET data = ?2, link = COALESCE(?3, link) WHERE seq = ?1",
+                params![seq, d.to_string(), link],
+            )?;
+        }
+        tx.execute("UPDATE outbox SET to_id = ?2 WHERE to_id = ?1", params![old, new])?;
+        let waits: Vec<(i64, MergeWait)> = read(&tx, "SELECT rowid, data FROM merge_waits", [])?;
+        for (row, mut w) in waits.into_iter().filter(|(_, w)| w.thread.as_deref() == Some(old)) {
+            w.thread = Some(new.into());
+            tx.execute("UPDATE merge_waits SET data = ?2 WHERE rowid = ?1", params![row, serde_json::to_string(&w)?])?;
+        }
+        let seen: Vec<(i64, PrSeen)> = read(&tx, "SELECT rowid, data FROM pr_seen", [])?;
+        for (row, mut p) in seen.into_iter().filter(|(_, p)| p.tickets.iter().any(|(t, _)| t == old)) {
+            for (t, _) in p.tickets.iter_mut().filter(|(t, _)| t == old) {
+                *t = new.into();
+            }
+            tx.execute("UPDATE pr_seen SET data = ?2 WHERE rowid = ?1", params![row, serde_json::to_string(&p)?])?;
+        }
+        tx.commit()?;
+        Ok(rebound)
+    }
+
     pub fn outbox_retarget(&self, from: &str, to: &str) -> Result<usize> {
         self.with(|c| c.execute("UPDATE outbox SET to_id = ?2 WHERE to_id = ?1", params![from, to]))
     }
@@ -979,6 +1080,12 @@ impl Store {
             c.query_row("SELECT open, data FROM asks WHERE seq = ?1", [seq], |r| Ok((r.get(0)?, r.get(1)?))).optional()
         })?;
         row.map(|(open, d)| Ok((open, serde_json::from_str(&d)?))).transpose()
+    }
+
+    pub fn ask_thread(&self, thread: &str) -> Result<bool> {
+        self.with(|c| {
+            c.query_row("SELECT EXISTS (SELECT 1 FROM asks WHERE thread = ?1)", params![thread], |r| r.get(0))
+        })
     }
 
     pub fn asks_open(&self) -> Result<Vec<(i64, Value)>> {
@@ -1144,17 +1251,37 @@ impl Store {
     }
 
     pub fn pick_launched(&self, seq: i64, handle: Option<&str>, thread: &str) -> Result<()> {
-        let raw: Option<String> =
-            self.with(|c| c.query_row("SELECT data FROM pool_picks WHERE seq = ?1", [seq], |r| r.get(0)).optional())?;
-        let Some(raw) = raw else { return Ok(()) };
-        let mut p: PickRecord = serde_json::from_str(&raw)?;
+        self.pick_bind(seq, handle, thread, None)
+    }
+
+    pub fn pick_bind(&self, seq: i64, handle: Option<&str>, thread: &str, moved_from: Option<&str>) -> Result<()> {
+        let Some(mut p) = self.pick_get(seq)? else { return Ok(()) };
         p.handle = handle.map(String::from);
         p.thread = Some(thread.to_string());
+        p.moved_from = moved_from.map(String::from);
         let s = serde_json::to_string(&p)?;
         self.with(|c| {
             c.execute("UPDATE pool_picks SET handle = ?2, data = ?3 WHERE seq = ?1", params![seq, handle, s])
         })?;
         Ok(())
+    }
+
+    pub fn pick_get(&self, seq: i64) -> Result<Option<PickRecord>> {
+        let raw: Option<String> =
+            self.with(|c| c.query_row("SELECT data FROM pool_picks WHERE seq = ?1", [seq], |r| r.get(0)).optional())?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+
+    pub fn pick_by_thread(&self, thread: &str) -> Result<Option<PickRecord>> {
+        let raw: Option<String> = self.with(|c| {
+            c.query_row(
+                "SELECT data FROM pool_picks WHERE json_extract(data, '$.thread') = ?1 ORDER BY seq DESC LIMIT 1",
+                [thread],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
     pub fn picks(&self, pool: &str, limit: usize) -> Result<Vec<PickRecord>> {

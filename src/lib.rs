@@ -15,6 +15,7 @@ pub mod issues;
 pub mod js;
 pub mod mcp;
 pub mod merge;
+pub mod moves;
 pub mod platform;
 pub mod pools;
 pub mod reconcile;

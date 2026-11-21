@@ -116,15 +116,21 @@ parent and a child, and the service keeps every link and message in its store.
   `reason` of `reported` or `ticket`, the existing `issue` or `ticket`, and a
   `message` that says which.
 - `wf.pick({ pool })` picks a member of a configured [pool](config.md#pools)
-  for one launch and returns `{ pool, instanceId, driver, model, effort,
+  for one launch and returns `{ pool, pick, instanceId, driver, model, effort,
   options, reason, skipped, modelSelection }`. Pass `modelSelection` to
   `t3_thread_launch`. `reason` names the driver, model and effort chosen and
   says why that member, and `skipped` lists each member left out with
   its reason, such as `limited until 14:00 MST`. Under the `cheapest`
   strategy, `reason` names the cost, as in
   `claudeAgent claude-opus-5-5, effort high; cheapest: cost 0, weighted: weight 1 of 2`.
-  The service records each pick. When no member can run, it throws and names
-  the pool.
+  The service records each pick, and `pick` is its id. When no member can
+  run, it throws and names the pool.
+- `wf.picked({ pick, thread })` records the thread a pick launched. The board
+  offers to move a thread to another member when it stops on a usage limit,
+  as [Moving a limited thread](config.md#moving-a-limited-thread) describes,
+  and only for a thread with a recorded pick. Board launches record theirs on
+  their own. It throws when the pick is unknown or already launched another
+  thread.
 - `wf.pools()` lists each pool, with `mixed` and the pool's `driver`, `model`
   and `effort` (`null` in a mixed pool), and its members with their `driver`,
   `model`, `effort`, `weight`, `reserve`, `cost`, `state` (`ready`, `limited`,
@@ -190,7 +196,8 @@ limited when one of their threads stops on a usage limit.
 ```js
 async () => {
   const p = await wf.pick({ pool: "opus" });
-  return t3.thread_launch({ projectId, title, message, modelSelection: p.modelSelection });
+  const r = await t3.thread_launch({ projectId, title, message, modelSelection: p.modelSelection });
+  return wf.picked({ pick: p.pick, thread: r.threadId });
 }
 ```
 

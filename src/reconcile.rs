@@ -825,6 +825,7 @@ head has passed or ended cancelled, skipped or neutral. A push drops the approva
                     options: None,
                     pr: Some(t.pr(head)),
                     approval,
+                    offer: None,
                 })?;
                 if kind == "gate" && l.gate.as_deref().is_none_or(|g| g == "merge") {
                     l.gate = Some("merge".into());
@@ -865,6 +866,7 @@ head has passed or ended cancelled, skipped or neutral. A push drops the approva
                     options: Some(Vec::new()),
                     pr: Some(t.pr(head)),
                     approval,
+                    offer: None,
                 })?;
                 mark(ticket.unwrap_or(BOARD))
             }

@@ -245,7 +245,10 @@ For PR n:
    the `threadId` and no `modelSelection`. When they differ from the
    slot's model, call `t3_thread_configure` again with the `modelSelection`
    from item 4 and tell the user.
-6. Tell the user the worker is running, by its `link`, verbatim, with the
+6. For a pool, report the launched thread with `wf.picked`, as
+   [A pool on a model slot](../t3-workflow/slots.md#a-pool-on-a-model-slot)
+   says.
+7. Tell the user the worker is running, by its `link`, verbatim, with the
    picked instance and its reason for a pool, and end the turn.
 
 ### Launch brief

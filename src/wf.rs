@@ -134,6 +134,13 @@ struct PickArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PickedArgs {
+    pick: i64,
+    thread: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdoptArgs {
     from: String,
 }
@@ -423,6 +430,10 @@ impl Wf {
                 return self.answer(&a.id, &a.text).await;
             }
             "pick" => return Ok(serde_json::to_value(self.pick(&parse::<PickArgs>(method, args)?.pool).await?)?),
+            "picked" => {
+                let a: PickedArgs = parse(method, args)?;
+                return self.picked(a.pick, &a.thread);
+            }
             "pools" => {
                 parse::<Empty>(method, args)?;
                 return self.pools().await;
@@ -972,6 +983,7 @@ impl Wf {
                 options: None,
                 pr: None,
                 approval: None,
+                offer: None,
             })?;
             return Ok(());
         }
@@ -1147,6 +1159,7 @@ impl Wf {
                     options: None,
                     pr: None,
                     approval: None,
+                    offer: None,
                 })?;
             } else {
                 let msg = format!("{}\n{body}", header("report", &p.label, &handle, None));

@@ -482,7 +482,7 @@ pub struct Picked {
     pub reason: String,
     pub skipped: Vec<Skipped>,
     pub model_selection: Value,
-    #[serde(skip)]
+    #[serde(rename = "pick")]
     pub seq: i64,
 }
 
@@ -622,9 +622,36 @@ impl Wf {
     }
 
     pub async fn pick(&self, name: &str) -> Result<Picked> {
-        let pool = self.pool(name)?;
-        let caps = self.pool_capabilities(pool).await?;
-        check_members(name, pool, &caps)?;
+        self.pick_avoiding(name, None).await
+    }
+
+    pub(crate) async fn pick_avoiding(&self, name: &str, avoid: Option<(&str, &str)>) -> Result<Picked> {
+        let mut pool = self.pool(name)?.clone();
+        let caps = self.pool_capabilities(&pool).await?;
+        check_members(name, &pool, &caps)?;
+        let mut avoided = Vec::new();
+        if let Some((id, why)) = avoid {
+            let driver_of = |i: &str| provider(&caps, i).and_then(|p| p["driverKind"].as_str()).map(String::from);
+            let driver = driver_of(id);
+            pool.members.retain(|m| {
+                let reason = if m.instance_id == id {
+                    Some(why.to_string())
+                } else {
+                    let d = driver_of(&m.instance_id);
+                    driver.as_ref().filter(|want| d.as_ref() != Some(want)).map(|want| {
+                        format!("is a {} instance, not {want} like the thread", d.as_deref().unwrap_or("unknown"))
+                    })
+                };
+                let keep = reason.is_none();
+                avoided.extend(reason.map(|reason| Skipped { instance_id: m.instance_id.clone(), reason }));
+                keep
+            });
+            if pool.members.is_empty() {
+                let like = driver.map(|d| format!(" that is a {d} instance")).unwrap_or_default();
+                bail!("pool {name} has no member other than {id}{like}");
+            }
+        }
+        let pool = &pool;
         let running = match pool.strategy.as_str() {
             "priority" => BTreeMap::new(),
             _ => self.running_by_instance().await?,
@@ -646,6 +673,12 @@ impl Wf {
             credits: &credits,
             now,
         })?;
+        let mut c = c;
+        for s in avoided {
+            let join = if c.skipped.is_empty() { "; skipped" } else { "," };
+            c.reason = format!("{}{join} {} {}", c.reason, s.instance_id, s.reason);
+            c.skipped.push(s);
+        }
         let at = self.now();
         self.store.pool_credits_put(name, &c.credits)?;
         let seq = self.store.pick_add(&PickRecord {
@@ -658,6 +691,7 @@ impl Wf {
             at,
             handle: None,
             thread: None,
+            moved_from: None,
         })?;
         Ok(Picked {
             pool: name.into(),
@@ -671,6 +705,23 @@ impl Wf {
             skipped: c.skipped,
             seq,
         })
+    }
+
+    pub fn picked(&self, seq: i64, thread: &str) -> Result<Value> {
+        let thread = thread.trim();
+        if thread.is_empty() {
+            bail!("wf.picked: empty thread");
+        }
+        let p =
+            self.store.pick_get(seq)?.ok_or_else(|| anyhow!("wf.picked: no pick {seq}; pass the pick from wf.pick"))?;
+        match p.thread.as_deref() {
+            Some(t) if t != thread => {
+                bail!("wf.picked: pick {seq} already launched thread {t}; pick again for another launch")
+            }
+            Some(_) => {}
+            None => self.store.pick_bind(seq, p.handle.as_deref(), thread, None)?,
+        }
+        Ok(json!({"pick": seq, "pool": p.pool, "instanceId": p.instance_id, "thread": thread}))
     }
 
     fn members(&self) -> BTreeSet<String> {
@@ -748,8 +799,9 @@ impl Wf {
                 want.insert(id, l);
             }
         };
-        for t in self.threads_with(&["failed"]).await? {
-            match self.limit_from_thread(&t, &members).await {
+        let failed = self.threads_with(&["failed"]).await?;
+        for t in &failed {
+            match self.limit_from_thread(t, &members).await {
                 Ok(Some((id, l))) => keep(id, l),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
@@ -784,6 +836,8 @@ impl Wf {
                 self.store.limit_set(&id, &l)?;
             }
         }
+        drop(_g);
+        actions.extend(self.offer_moves(&failed).await);
         if !actions.is_empty() {
             self.changed();
         }

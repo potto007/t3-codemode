@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::clock::{local_clock, parse_ts};
 use crate::contexts::ProjectFilter;
 use crate::issues::issue_key;
+use crate::moves::Offer;
 use crate::pools::Picked;
 use crate::reconcile::{CardPr, card_pr};
 use crate::store::{Link, Pending};
@@ -309,6 +310,8 @@ pub struct Card {
     pub seq: i64,
     #[serde(skip)]
     pub pr: Option<CardPr>,
+    #[serde(skip)]
+    pub offer: Option<Offer>,
 }
 
 pub struct NewCard<'a> {
@@ -321,6 +324,7 @@ pub struct NewCard<'a> {
     pub options: Option<Vec<String>>,
     pub pr: Option<CardPr>,
     pub approval: Option<&'a str>,
+    pub offer: Option<&'a Offer>,
 }
 
 #[derive(Deserialize)]
@@ -649,6 +653,7 @@ impl Wf {
                     approval: s("approval"),
                     seq,
                     pr: serde_json::from_value(d["pr"].clone()).ok().flatten(),
+                    offer: serde_json::from_value(d["move"].clone()).ok().flatten(),
                 }
             })
             .collect())
@@ -675,6 +680,9 @@ impl Wf {
         let mut data = json!({"kind": c.kind, "ticket": c.ticket, "handle": c.handle, "options": options, "pr": pr});
         if let Some(a) = c.approval {
             data["approval"] = json!(a);
+        }
+        if let Some(o) = c.offer {
+            data["move"] = json!(o);
         }
         let id = self.alloc_waiting(
             BOARD,
@@ -739,6 +747,7 @@ impl Wf {
                 options: Some(options.clone()),
                 pr: None,
                 approval: None,
+                offer: None,
             })?;
             let mut out = json!({"handle": handle, "delivery": "board", "card": id, "options": options,
                 "detail": format!("on the user's board as {id}; the answer arrives here as a [t3cm reply]")});
@@ -770,6 +779,9 @@ impl Wf {
             .find(|c| c.id == id)
             .ok_or_else(|| anyhow!("no open board card {id:?}; wf.cards() lists the open ones"))?;
         same_card(&card, id, want)?;
+        if let Some(offer) = card.offer.clone() {
+            return self.answer_offer(&card, &offer, text).await;
+        }
         let ticket = card
             .ticket
             .clone()
@@ -972,6 +984,7 @@ impl Wf {
             options: None,
             pr: None,
             approval: None,
+            offer: None,
         })?;
         Ok(json!({"ok": false, "label": label, "error": text, "card": card}))
     }

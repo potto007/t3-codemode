@@ -124,7 +124,10 @@ For each approved issue:
    <the `brief` block from wf.openChild, verbatim>
    ```
 
-4. Tell the user it is running, by its `link`, verbatim, with the picked
+4. For a pool, report the launched thread with `wf.picked`, as
+   [A pool on a model slot](../t3-workflow/slots.md#a-pool-on-a-model-slot)
+   says.
+5. Tell the user it is running, by its `link`, verbatim, with the picked
    instance and its reason for a pool.
 
 Ticket threads in one repo run side by side. Each merges its own PRs; a PR

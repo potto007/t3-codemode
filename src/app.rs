@@ -76,7 +76,7 @@ const EXEC_PRELUDE: &str = r#"
     gate: m("gate"), close: m("close"), inbox: m("inbox"), board: m("board"), adopt: m("adopt"), sweep: m("sweep"),
     show: (handle) => call("wf.show", { handle }),
     launchTicket: m("launchTicket"), cards: m("cards"), feed: m("feed"), merge: m("merge"),
-    pick: m("pick"), pools: m("pools"), issue: m("issue"), status: m("status"),
+    pick: m("pick"), picked: m("picked"), pools: m("pools"), issue: m("issue"), status: m("status"),
     slot: (name, x) => call("wf.slot", Object.assign({}, input(x) || {}, { name })),
     slots: m("slots"), renewal: m("renewal"),
     answer: (id, text) => call("wf.answer", { id, text }),

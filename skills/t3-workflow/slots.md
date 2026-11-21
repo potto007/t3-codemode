@@ -86,6 +86,11 @@ every configured pool exists in t3cm's config.
   earlier pick: each pick moves the pool's balance. Tell the parent (at the
   root, the user) the picked `instanceId` and its `reason` in the line that
   reports the launch.
+- **After the launch**, report the thread it made:
+  `async () => wf.picked({ pick: <the pick's pick>, thread: "<threadId>" })`.
+  When that thread later stops on a usage limit, the board offers to move it
+  to another member of the pool. A thread launched without this report gets
+  no offer.
 - **The pick throws** (no member can run; the message names the pool and
   why each member is out): launch nothing. Send the message as a gate with
   the action line `reply "retry" once a member is back, or "default" to

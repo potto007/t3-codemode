@@ -239,6 +239,8 @@ pub struct PickRecord {
     pub handle: Option<String>,
     #[serde(default)]
     pub thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -533,6 +535,10 @@ impl Store {
         } else {
             self.links_where("WHERE parent = ?1", [parent])
         }
+    }
+
+    pub fn link_delete(&self, child: &str) -> Result<bool> {
+        Ok(self.with(|c| c.execute("DELETE FROM links WHERE child = ?1", [child]))? > 0)
     }
 
     pub fn link_save(&self, ln: &Link) -> Result<()> {
@@ -1144,17 +1150,37 @@ impl Store {
     }
 
     pub fn pick_launched(&self, seq: i64, handle: Option<&str>, thread: &str) -> Result<()> {
-        let raw: Option<String> =
-            self.with(|c| c.query_row("SELECT data FROM pool_picks WHERE seq = ?1", [seq], |r| r.get(0)).optional())?;
-        let Some(raw) = raw else { return Ok(()) };
-        let mut p: PickRecord = serde_json::from_str(&raw)?;
+        self.pick_bind(seq, handle, thread, None)
+    }
+
+    pub fn pick_bind(&self, seq: i64, handle: Option<&str>, thread: &str, moved_from: Option<&str>) -> Result<()> {
+        let Some(mut p) = self.pick_get(seq)? else { return Ok(()) };
         p.handle = handle.map(String::from);
         p.thread = Some(thread.to_string());
+        p.moved_from = moved_from.map(String::from);
         let s = serde_json::to_string(&p)?;
         self.with(|c| {
             c.execute("UPDATE pool_picks SET handle = ?2, data = ?3 WHERE seq = ?1", params![seq, handle, s])
         })?;
         Ok(())
+    }
+
+    pub fn pick_get(&self, seq: i64) -> Result<Option<PickRecord>> {
+        let raw: Option<String> =
+            self.with(|c| c.query_row("SELECT data FROM pool_picks WHERE seq = ?1", [seq], |r| r.get(0)).optional())?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+
+    pub fn pick_by_thread(&self, thread: &str) -> Result<Option<PickRecord>> {
+        let raw: Option<String> = self.with(|c| {
+            c.query_row(
+                "SELECT data FROM pool_picks WHERE json_extract(data, '$.thread') = ?1 ORDER BY seq DESC LIMIT 1",
+                [thread],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
     pub fn picks(&self, pool: &str, limit: usize) -> Result<Vec<PickRecord>> {

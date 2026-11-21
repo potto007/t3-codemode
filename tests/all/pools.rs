@@ -1119,3 +1119,171 @@ async fn a_mixed_pool_counts_only_members_that_can_run_their_model() {
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(w[0].starts_with("codex-a is the only codex member"), "{w:?}");
 }
+
+fn limit_stop_on(h: &H, id: &str) {
+    h.fake.update(id, json!({"status": "failed", "itemCount": 10, "updatedAt": T0}));
+    let text = "You've hit your usage limit. Try again later.";
+    h.fake.set_items(id, vec![usage_limit_item(&format!("run:{id}:1"), text)]);
+}
+
+fn move_cards(h: &H) -> Vec<t3_codemode::board::Card> {
+    h.app.wf.cards().unwrap().into_iter().filter(|c| c.offer.is_some()).collect()
+}
+
+#[tokio::test]
+async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
+    let h = pooled("weighted", two(1, 1));
+    let ticket = launch(&h, 41).await;
+    let (old, first) = (ticket["thread"].as_str().unwrap().to_string(), ticket["instanceId"].as_str().unwrap());
+    let other = if first == "claude-a" { "claude-b" } else { "claude-a" };
+    h.wf(&old, "join", json!({"parent": BOARD, "label": "widgets#41", "role": "ticket"})).await;
+    let worker = h.wf(&old, "openChild", json!({"role": "worker", "label": "widgets#41 PR 1/1"})).await;
+    assert!(worker["brief"].is_string(), "{worker}");
+    h.wf("mcp:worker-41", "join", json!({"parent": old, "label": "widgets#41 PR 1/1", "role": "worker"})).await;
+    let running = launch(&h, 42).await["thread"].as_str().unwrap().to_string();
+    let direct = h
+        .exec(&format!(
+            "async () => t3.call('t3_thread_launch', {{ projectId: 'p-widgets', title: 'direct', message: 'm',
+               modelSelection: {{ instanceId: '{first}', model: '{OPUS}' }} }})"
+        ))
+        .await;
+    let direct = result(&direct)["threadId"].as_str().unwrap().to_string();
+    limit_stop_on(&h, &old);
+    limit_stop_on(&h, &direct);
+    limit_stop_on(&h, &running);
+    h.fake.update(&running, json!({"status": "running"}));
+
+    let actions = mark(&h).await;
+    let cards = move_cards(&h);
+    assert_eq!(cards.len(), 1, "{actions:?} {cards:?}");
+    let card = &cards[0];
+    assert_eq!(card.ticket.as_deref(), Some(old.as_str()));
+    assert_eq!(card.label.as_deref(), Some("widgets#41"));
+    assert_eq!(card.options, ["move", "wait"]);
+    assert!(card.text.contains(&format!("widgets#41 stopped on a usage limit on {first}")), "{}", card.text);
+    assert!(
+        actions.iter().any(|a| a == &format!("offered to move widgets#41 off {first} as {}", card.id)),
+        "{actions:?}"
+    );
+    mark(&h).await;
+    assert_eq!(move_cards(&h).len(), 1);
+
+    let moved = h.app.wf.answer(&card.id, "move").await.unwrap();
+    let fork = moved["thread"].as_str().unwrap().to_string();
+    assert_eq!(moved["instanceId"], other, "{moved}");
+    assert_eq!(moved["from"], old.as_str());
+    let f = h.fake.thread(&fork).unwrap();
+    assert_eq!(f["forkedFrom"], old.as_str());
+    assert_eq!(f["providerInstanceId"], other);
+    assert_eq!(f["model"], OPUS);
+    assert_eq!(
+        h.fake.configured().last().unwrap()["modelSelection"],
+        json!({"instanceId": other, "model": OPUS, "options": [{"id": "effort", "value": "high"}]})
+    );
+
+    let ln = h.app.store.link_get(&fork).unwrap().expect("the ticket link moved to the fork");
+    assert_eq!((ln.label.as_str(), ln.parent.as_str(), ln.closed), ("widgets#41", BOARD, false));
+    assert!(h.app.store.link_get(&old).unwrap().is_none());
+    assert_eq!(h.app.store.link_get("mcp:worker-41").unwrap().unwrap().parent, fork);
+
+    let pick = &h.app.store.picks("opus", 1).unwrap()[0];
+    assert_eq!(pick.instance_id, other);
+    assert_eq!(pick.thread.as_deref(), Some(fork.as_str()));
+    assert_eq!(pick.moved_from.as_deref(), Some(old.as_str()));
+    assert!(pick.reason.contains(&format!("skipped {first} is the member the thread stopped on")), "{}", pick.reason);
+    let feed = h.app.wf.feed(20).unwrap();
+    let entry = feed.iter().find(|f| f["head"].as_str().unwrap().starts_with("moved ")).expect("a move entry");
+    assert_eq!(entry["instanceId"], other);
+    assert!(entry["head"].as_str().unwrap().contains(&format!("from {first} to {fork}")), "{entry}");
+
+    let resume = h.sent().into_iter().find(|s| s["threadId"] == fork.as_str()).expect("the fork was resumed");
+    assert!(resume["message"].as_str().unwrap().contains(&format!("now runs on {other}")), "{resume}");
+    assert!(h.fake.organized().iter().any(|o| o["threadId"] == old.as_str() && o["action"] == "settle"));
+    assert!(move_cards(&h).is_empty());
+    assert!(
+        h.app
+            .wf
+            .cards_with(true)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == card.id && c.resolution.as_deref().is_some_and(|r| r.starts_with("answered: move")))
+    );
+    mark(&h).await;
+    assert!(move_cards(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_reported_with_wf_picked_is_offered_and_wait_leaves_it() {
+    let h = pooled("priority", two(1, 1));
+    let launched = h
+        .exec(
+            "async () => { const p = await wf.pick({ pool: 'opus' });
+               const r = await t3.call('t3_thread_launch', { projectId: 'p-widgets', title: 'worker', message: 'm',
+                 modelSelection: p.modelSelection });
+               return wf.picked({ pick: p.pick, thread: r.threadId }); }",
+        )
+        .await;
+    let r = result(&launched);
+    let thread = r["thread"].as_str().unwrap().to_string();
+    assert_eq!((r["pool"].as_str(), r["instanceId"].as_str()), (Some("opus"), Some("claude-a")), "{r}");
+    let again = h.wf_err(&thread, "picked", json!({"pick": r["pick"], "thread": "launch:99"})).await;
+    assert!(again.contains(&format!("already launched thread {thread}")), "{again}");
+    assert!(h.wf_err(&thread, "picked", json!({"pick": 999, "thread": thread})).await.contains("no pick 999"));
+
+    limit_stop_on(&h, &thread);
+    mark(&h).await;
+    let cards = move_cards(&h);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].label.as_deref(), Some("worker"));
+    let e = format!("{:#}", h.app.wf.answer(&cards[0].id, "later").await.unwrap_err());
+    assert!(e.contains("takes \"move\" or \"wait\""), "{e}");
+    let w = h.app.wf.answer(&cards[0].id, "wait").await.unwrap();
+    assert_eq!(w["moved"], false);
+    assert!(move_cards(&h).is_empty());
+    assert!(h.fake.configured().is_empty());
+    mark(&h).await;
+    assert!(move_cards(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_thread_that_ran_again_is_not_moved_and_its_card_goes() {
+    let h = pooled("weighted", two(1, 1));
+    let old = launch(&h, 43).await["thread"].as_str().unwrap().to_string();
+    limit_stop_on(&h, &old);
+    mark(&h).await;
+    let id = move_cards(&h)[0].id.clone();
+    h.fake.update(&old, json!({"status": "running", "activeRunId": format!("run:{old}:2")}));
+    let e = format!("{:#}", h.app.wf.answer(&id, "move").await.unwrap_err());
+    assert!(e.contains("ran again after its usage limit, so nothing was moved"), "{e}");
+    assert!(h.fake.configured().is_empty());
+    mark(&h).await;
+    assert!(move_cards(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_move_in_a_mixed_pool_keeps_the_thread_on_its_driver() {
+    let members = json!([{"instanceId": "codex-a", "model": ASTRA, "effort": "xhigh"},
+                         {"instanceId": "claude-a", "model": OPUS, "effort": "high"},
+                         {"instanceId": "codex-b", "model": ASTRA, "effort": "xhigh"}]);
+    let c = json!({"pools": {"frontier": {"mixed": true, "strategy": "priority", "members": members}},
+                   "board": {"pool": "frontier"}});
+    let h = H::build(Vec::new(), Config::from_value(c).unwrap());
+    h.fake.set_providers(vec![
+        codex("codex-a"),
+        provider("claude-a", "claudeAgent", &[OPUS, "claude-haiku-5-5"]),
+        codex("codex-b"),
+    ]);
+    h.fake.set_projects(vec![project("p-widgets", "/src/widgets")]);
+    h.remotes.set("/src/widgets", "git@github.com:acme/widgets.git");
+    let ticket = launch(&h, 44).await;
+    assert_eq!(ticket["instanceId"], "codex-a", "{ticket}");
+    let old = ticket["thread"].as_str().unwrap().to_string();
+    limit_stop_on(&h, &old);
+    mark(&h).await;
+    let id = move_cards(&h)[0].id.clone();
+    let out = h.app.wf.answer(&id, "move").await.unwrap();
+    assert_eq!(out["instanceId"], "codex-b", "{out}");
+    let reason = out["reason"].as_str().unwrap();
+    assert!(reason.contains("claude-a is a claudeAgent instance, not codex like the thread"), "{reason}");
+    assert!(reason.contains("codex-a is the member the thread stopped on"), "{reason}");
+}

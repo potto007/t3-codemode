@@ -220,11 +220,18 @@ pub fn builtins() -> Vec<Entry> {
         builtin(
             "wf.pick",
             "wf",
-            "Pick a provider instance from a configured pool for one launch. The result and its reason name the driver, model and effort chosen: the pool's model and effort, or in a mixed pool the chosen member's own. Skips members T3 reports disabled or constrained, members that do not list their model or offer their effort, and members marked limited; a member with a reserve is a last resort, picked only when every other member is out. Under strategy cheapest, the lowest-cost members that can run take every launch, by weight among themselves. Pass modelSelection to t3_thread_launch. Throws, naming the pool, when no member can run or, in a pool that is not mixed, a member is not an instance of the pool's driver; nothing is launched.",
+            "Pick a provider instance from a configured pool for one launch. The result and its reason name the driver, model and effort chosen: the pool's model and effort, or in a mixed pool the chosen member's own. Skips members T3 reports disabled or constrained, members that do not list their model or offer their effort, and members marked limited; a member with a reserve is a last resort, picked only when every other member is out. Under strategy cheapest, the lowest-cost members that can run take every launch, by weight among themselves. Pass modelSelection to t3_thread_launch, then report the launched thread with wf.picked. Throws, naming the pool, when no member can run or, in a pool that is not mixed, a member is not an instance of the pool's driver; nothing is launched.",
             &format!(
-                "wf.pick(input: {{ pool: string }}): Promise<{{ pool: string; instanceId: string; driver: string; model: string; effort: string | null; options: {{ id: string; value: string }}[]; reason: string; skipped: {SKIPPED}[]; modelSelection: {{ instanceId: string; model: string; options?: {{ id: string; value: string }}[] }} }}>;"
+                "wf.pick(input: {{ pool: string }}): Promise<{{ pool: string; pick: number; instanceId: string; driver: string; model: string; effort: string | null; options: {{ id: string; value: string }}[]; reason: string; skipped: {SKIPPED}[]; modelSelection: {{ instanceId: string; model: string; options?: {{ id: string; value: string }}[] }} }}>;"
             ),
             obj(json!({"pool": {"type": "string"}}), &["pool"]),
+        ),
+        builtin(
+            "wf.picked",
+            "wf",
+            "Record the thread a wf.pick launched, so the board can offer to move that thread to another member of its pool when it stops on a usage limit. A thread launched without a recorded pick never gets that offer. Throws when the pick is unknown or already launched another thread.",
+            "wf.picked(input: { pick: number; thread: string }): Promise<{ pick: number; pool: string; instanceId: string; thread: string }>;",
+            obj(json!({"pick": {"type": "integer"}, "thread": {"type": "string"}}), &["pick", "thread"]),
         ),
         builtin(
             "wf.pools",

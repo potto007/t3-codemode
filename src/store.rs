@@ -926,9 +926,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn waiting_set_link(&self, owner: &str, seq: i64, link: &str) -> Result<()> {
+    pub fn waiting_retarget(&self, owner: &str, seq: i64, data: &Value, link: Option<&str>) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE waiting SET link = ?3 WHERE owner = ?1 AND seq = ?2", params![owner, seq, link])
+            c.execute(
+                "UPDATE waiting SET data = ?3, link = COALESCE(?4, link) WHERE owner = ?1 AND seq = ?2",
+                params![owner, seq, data.to_string(), link],
+            )
         })?;
         Ok(())
     }

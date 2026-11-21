@@ -1142,6 +1142,38 @@ async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
     h.wf("mcp:worker-41", "join", json!({"parent": old, "label": "widgets#41 PR 1/1", "role": "worker"})).await;
     h.wf(&old, "send", json!({"kind": "gate", "gate": "plan", "body": "**ACTION NEEDED:** reply \"go\" to start"}))
         .await;
+    h.app
+        .store
+        .merge_wait_put(&t3_codemode::store::MergeWait {
+            repo: "acme/widgets".into(),
+            pr: 7,
+            head: "abc1234".into(),
+            pull_request_id: "PR_7".into(),
+            method: None,
+            thread: Some(old.clone()),
+            label: Some("widgets#41".into()),
+            merge_state: "CLEAN".into(),
+            at: T0.into(),
+            status: Default::default(),
+            approval: String::new(),
+            failures: 0,
+            last_error: None,
+        })
+        .unwrap();
+    h.app
+        .store
+        .pr_seen_put(&t3_codemode::store::PrSeen {
+            repo: "acme/widgets".into(),
+            pr: 7,
+            state: "OPEN".into(),
+            head: "abc1234".into(),
+            queued: false,
+            since: T0.into(),
+            tickets: vec![(old.clone(), T0.into()), ("mcp:other".into(), T0.into())],
+            at: T0.into(),
+            left: None,
+        })
+        .unwrap();
     let running = launch(&h, 42).await["thread"].as_str().unwrap().to_string();
     let direct = h
         .exec(&format!(
@@ -1189,6 +1221,10 @@ async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
     assert_eq!(h.app.store.link_get("mcp:worker-41").unwrap().unwrap().parent, fork);
     let gate = h.app.wf.cards().unwrap().into_iter().find(|c| c.offer.is_none() && c.text.contains("\"go\"")).unwrap();
     assert_eq!(gate.ticket.as_deref(), Some(fork.as_str()), "{gate:?}");
+    let wait = h.app.store.merge_wait_get("acme/widgets", 7).unwrap().unwrap();
+    assert_eq!(wait.thread.as_deref(), Some(fork.as_str()));
+    let seen = h.app.store.pr_seen_get("acme/widgets", 7).unwrap().unwrap();
+    assert_eq!(seen.tickets, [(fork.clone(), T0.to_string()), ("mcp:other".to_string(), T0.to_string())]);
     assert_eq!(gate.link.as_deref(), Some(format!("https://t3/{fork}").as_str()), "{gate:?}");
 
     let pick = &h.app.store.picks("opus", 1).unwrap()[0];

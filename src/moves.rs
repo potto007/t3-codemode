@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 
 use crate::board::{BOARD, Card, NewCard};
 use crate::clock::local_clock;
-use crate::store::{Link, Pending};
 use crate::wf::Wf;
 
 pub const MOVE: &str = "move";
@@ -158,7 +157,9 @@ impl Wf {
             );
         }
         let link = f["link"].as_str().map(String::from);
-        let rebound = self.rebind(old, &new, link.as_deref())?;
+        let rebound = self.store.rebind(old, &new, link.as_deref(), BOARD, &self.now()).map_err(|e| {
+            anyhow!("forked {} as {new}, but moving its workflow links to the fork failed: {e:#}", o.title)
+        })?;
         self.note_live(&new, f);
         let summary = format!("moved {} from {} to {new} {}", o.title, o.instance_id, picked.summary());
         let handle = self.store.msg_new(BOARD, BOARD, "note", &summary, &self.now())?;
@@ -186,46 +187,5 @@ impl Wf {
             out["warnings"] = json!(warnings);
         }
         Ok(out)
-    }
-
-    fn rebind(&self, old: &str, new: &str, link: Option<&str>) -> Result<bool> {
-        let mut rebound = false;
-        if let Some(ln) = self.store.link_get(old)?.filter(|l| !l.closed) {
-            let moved = Link {
-                child: new.into(),
-                link: link.map(String::from).or(ln.link.clone()),
-                last_nudge: None,
-                nudges: 0,
-                escalated: false,
-                bad_run: None,
-                settled_at: None,
-                ..ln
-            };
-            self.store.link_delete(old)?;
-            self.store.link_save(&moved)?;
-            rebound = true;
-        }
-        for mut ln in self.store.children(old, true)? {
-            ln.parent = new.into();
-            self.store.link_save(&ln)?;
-            rebound = true;
-        }
-        if let Some(role) = self.store.node_role(old)? {
-            self.store.node_set(new, &role, &self.now())?;
-        }
-        self.store.pending_retarget(old, new)?;
-        for p in self.store.pending_all()?.into_iter().filter(|p| p.thread.as_deref() == Some(old)) {
-            let link = link.map(String::from).or(p.link.clone());
-            self.store.pending_put(&Pending { thread: Some(new.into()), link, ..p })?;
-            rebound = true;
-        }
-        for (_, data, _, seq) in self.store.waiting_data(BOARD, false)? {
-            if let Some(mut d) = data.filter(|d| d["ticket"] == old && d["move"].is_null()) {
-                d["ticket"] = json!(new);
-                self.store.waiting_retarget(BOARD, seq, &d, link)?;
-            }
-        }
-        self.store.outbox_retarget(old, new)?;
-        Ok(rebound)
     }
 }

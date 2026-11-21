@@ -1140,6 +1140,8 @@ async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
     let worker = h.wf(&old, "openChild", json!({"role": "worker", "label": "widgets#41 PR 1/1"})).await;
     assert!(worker["brief"].is_string(), "{worker}");
     h.wf("mcp:worker-41", "join", json!({"parent": old, "label": "widgets#41 PR 1/1", "role": "worker"})).await;
+    h.wf(&old, "send", json!({"kind": "gate", "gate": "plan", "body": "**ACTION NEEDED:** reply \"go\" to start"}))
+        .await;
     let running = launch(&h, 42).await["thread"].as_str().unwrap().to_string();
     let direct = h
         .exec(&format!(
@@ -1185,6 +1187,8 @@ async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
     assert_eq!((ln.label.as_str(), ln.parent.as_str(), ln.closed), ("widgets#41", BOARD, false));
     assert!(h.app.store.link_get(&old).unwrap().is_none());
     assert_eq!(h.app.store.link_get("mcp:worker-41").unwrap().unwrap().parent, fork);
+    let gate = h.app.wf.cards().unwrap().into_iter().find(|c| c.offer.is_none() && c.text.contains("\"go\"")).unwrap();
+    assert_eq!(gate.ticket.as_deref(), Some(fork.as_str()), "{gate:?}");
 
     let pick = &h.app.store.picks("opus", 1).unwrap()[0];
     assert_eq!(pick.instance_id, other);
@@ -1286,4 +1290,22 @@ async fn a_move_in_a_mixed_pool_keeps_the_thread_on_its_driver() {
     let reason = out["reason"].as_str().unwrap();
     assert!(reason.contains("claude-a is a claudeAgent instance, not codex like the thread"), "{reason}");
     assert!(reason.contains("codex-a is the member the thread stopped on"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_ticket_limited_before_it_joins_moves_its_launch_row_and_a_board_question_gets_no_card() {
+    let h = pooled("priority", two(1, 1));
+    let old = launch(&h, 45).await["thread"].as_str().unwrap().to_string();
+    let ask = h.app.wf.ask("Which tickets wait on me?").await.unwrap();
+    let ask = ask["thread"].as_str().unwrap().to_string();
+    limit_stop_on(&h, &old);
+    limit_stop_on(&h, &ask);
+    mark(&h).await;
+    let cards = move_cards(&h);
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0].ticket.as_deref(), Some(old.as_str()));
+    let moved = h.app.wf.answer(&cards[0].id, "move").await.unwrap();
+    let fork = moved["thread"].as_str().unwrap();
+    let rows = h.app.store.pending_all().unwrap();
+    assert_eq!(rows.iter().filter_map(|p| p.thread.as_deref()).collect::<Vec<_>>(), [fork], "{rows:?}");
 }

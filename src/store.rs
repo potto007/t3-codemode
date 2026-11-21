@@ -987,6 +987,12 @@ impl Store {
         row.map(|(open, d)| Ok((open, serde_json::from_str(&d)?))).transpose()
     }
 
+    pub fn ask_thread(&self, thread: &str) -> Result<bool> {
+        self.with(|c| {
+            c.query_row("SELECT EXISTS (SELECT 1 FROM asks WHERE thread = ?1)", params![thread], |r| r.get(0))
+        })
+    }
+
     pub fn asks_open(&self) -> Result<Vec<(i64, Value)>> {
         self.asks_where("WHERE open = 1 ORDER BY seq")
     }

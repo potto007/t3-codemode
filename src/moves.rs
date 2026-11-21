@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::board::{BOARD, Card, NewCard};
 use crate::clock::local_clock;
-use crate::store::Link;
+use crate::store::{Link, Pending};
 use crate::wf::Wf;
 
 pub const MOVE: &str = "move";
@@ -63,6 +63,9 @@ impl Wf {
             return Ok(None);
         }
         let Some(pick) = self.store.pick_by_thread(thread)? else { return Ok(None) };
+        if self.store.ask_thread(thread)? {
+            return Ok(None);
+        }
         if !self.config.pools.contains_key(&pick.pool) {
             return Ok(None);
         }
@@ -211,6 +214,17 @@ impl Wf {
             self.store.node_set(new, &role, &self.now())?;
         }
         self.store.pending_retarget(old, new)?;
+        for p in self.store.pending_all()?.into_iter().filter(|p| p.thread.as_deref() == Some(old)) {
+            let link = link.map(String::from).or(p.link.clone());
+            self.store.pending_put(&Pending { thread: Some(new.into()), link, ..p })?;
+            rebound = true;
+        }
+        for (_, data, _, seq) in self.store.waiting_data(BOARD, false)? {
+            if let Some(mut d) = data.filter(|d| d["ticket"] == old && d["move"].is_null()) {
+                d["ticket"] = json!(new);
+                self.store.waiting_set_data(BOARD, seq, &d)?;
+            }
+        }
         self.store.outbox_retarget(old, new)?;
         Ok(rebound)
     }

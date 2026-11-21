@@ -1189,6 +1189,7 @@ async fn a_limited_pool_ticket_moves_to_another_ready_member_on_one_card() {
     assert_eq!(h.app.store.link_get("mcp:worker-41").unwrap().unwrap().parent, fork);
     let gate = h.app.wf.cards().unwrap().into_iter().find(|c| c.offer.is_none() && c.text.contains("\"go\"")).unwrap();
     assert_eq!(gate.ticket.as_deref(), Some(fork.as_str()), "{gate:?}");
+    assert_eq!(gate.link.as_deref(), Some(format!("https://t3/{fork}").as_str()), "{gate:?}");
 
     let pick = &h.app.store.picks("opus", 1).unwrap()[0];
     assert_eq!(pick.instance_id, other);

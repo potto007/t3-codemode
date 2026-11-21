@@ -223,6 +223,9 @@ impl Wf {
             if let Some(mut d) = data.filter(|d| d["ticket"] == old && d["move"].is_null()) {
                 d["ticket"] = json!(new);
                 self.store.waiting_set_data(BOARD, seq, &d)?;
+                if let Some(l) = link {
+                    self.store.waiting_set_link(BOARD, seq, l)?;
+                }
             }
         }
         self.store.outbox_retarget(old, new)?;

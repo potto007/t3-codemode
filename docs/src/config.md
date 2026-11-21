@@ -278,9 +278,10 @@ with its context and worktree, switches the fork to the new member, moves the
 thread's workflow links to the fork, resumes the fork, and settles the old
 thread. The pick history and the feed record the move.
 
-The card goes only to a thread with a recorded pick: a board launch, or a
-launch reported with [`wf.picked`](globals.md#wf). A thread launched straight
-on an instance never gets one. A thread that runs again before the answer
+The card goes only to a thread with a recorded pick: a ticket the board
+launched, or a launch reported with [`wf.picked`](globals.md#wf). A thread
+launched straight on an instance never gets one, and neither does a board
+question. A thread that runs again before the answer
 loses its card, and a move refuses a thread that is running.
 
 ### Updates

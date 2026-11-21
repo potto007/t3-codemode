@@ -4409,3 +4409,324 @@ async fn a_new_slot_or_a_broken_config_names_the_setup_skill() {
     assert_eq!(r["label"], "Workflow config ignored", "{r}");
     assert!(r["msg"].as_str().unwrap().contains("The T3 workflow config is ignored: not JSON"), "{r}");
 }
+
+fn write_workflow_config(h: &H, cfg: Value) {
+    let p = h.dir.path().join("home/.config/t3-workflow/config.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, cfg.to_string()).unwrap();
+}
+
+fn codex_provider(id: &str, models: &[&str]) -> Value {
+    let mut p = t3_codemode::fake::provider(id, "codex", models);
+    for m in p["models"].as_array_mut().unwrap() {
+        m["options"] = json!([{"id": "reasoningEffort", "values": ["low", "medium", "high", "xhigh"]}]);
+    }
+    p
+}
+
+#[tokio::test]
+async fn board_launch_resolves_user_config_repo_agents_md_and_precedence() {
+    use t3_codemode::fake::provider;
+
+    let s = start(H::new()).await;
+    let repo = s.h.dir.path().join("widgets");
+    std::fs::create_dir_all(&repo).unwrap();
+    s.h.fake.set_projects(vec![project("p-widgets", &repo.to_string_lossy())]);
+    s.h.remotes.set(&repo.to_string_lossy(), "git@github.com:acme/widgets.git");
+    s.h.fake.set_providers(vec![
+        provider("claudeAgent", "claudeAgent", &["claude-opus-5-5", "claude-haiku-5-5", "claude-catalog-only"]),
+        provider("claude-2", "claudeAgent", &["claude-opus-5-5", "claude-haiku-5-5", "claude-catalog-only"]),
+        codex_provider("codex", &["gpt-6.2-sol"]),
+    ]);
+
+    // 1. User config sets instance, model and effort (even though claudeAgent is listed first).
+    write_workflow_config(
+        &s.h,
+        json!({"models": {"ticket": {"provider": "claude-2", "model": "claude-opus-5-5", "effort": "medium"}}}),
+    );
+    let r = s.post("/api/launch", json!({"issues": ["acme/widgets#1"]}), Some(&s.csrf()), None).await;
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let res = &body["results"][0];
+    assert_eq!(res["ok"], true, "{res}");
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-opus-5-5");
+    assert_eq!(res["effort"], "medium");
+    assert_eq!(res["modelSource"], "user");
+    assert_eq!(
+        s.h.fake.launched()[0]["modelSelection"],
+        json!({"instanceId": "claude-2", "model": "claude-opus-5-5", "options": [{"id": "effort", "value": "medium"}]})
+    );
+
+    // 2. Repo AGENTS.md overrides effort while keeping user's provider for the same model.
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: claude-opus-5-5, low effort\n")
+        .unwrap();
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#2' })").await);
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-opus-5-5");
+    assert_eq!(res["effort"], "low");
+    assert_eq!(res["modelSource"], "AGENTS.md");
+    assert_eq!(
+        s.h.fake.launched()[1]["modelSelection"],
+        json!({"instanceId": "claude-2", "model": "claude-opus-5-5", "options": [{"id": "effort", "value": "low"}]})
+    );
+
+    // 3. Repo AGENTS.md switches to a Codex model (no restart needed).
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: gpt-6.2-sol, xhigh effort\n").unwrap();
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#3' })").await);
+    assert_eq!(res["instanceId"], "codex");
+    assert_eq!(res["model"], "gpt-6.2-sol");
+    assert_eq!(res["effort"], "xhigh");
+    assert_eq!(res["modelSource"], "AGENTS.md");
+    assert_eq!(
+        s.h.fake.launched()[2]["modelSelection"],
+        json!({"instanceId": "codex", "model": "gpt-6.2-sol", "options": [{"id": "reasoningEffort", "value": "xhigh"}]})
+    );
+
+    // 4. Repo .t3-workflow.json overrides AGENTS.md.
+    std::fs::write(
+        repo.join(".t3-workflow.json"),
+        json!({"models": {"ticket": {"provider": "claude-2", "model": "claude-opus-5-5", "effort": "high"}}})
+            .to_string(),
+    )
+    .unwrap();
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#4' })").await);
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-opus-5-5");
+    assert_eq!(res["effort"], "high");
+    assert_eq!(res["modelSource"], ".t3-workflow.json");
+
+    // 5. Launch arg overrides .t3-workflow.json (both model+effort and effort-only).
+    let res = result(
+        &s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#5', model: 'gpt-6.2-sol', effort: 'medium' })")
+            .await,
+    );
+    assert_eq!(res["instanceId"], "codex");
+    assert_eq!(res["model"], "gpt-6.2-sol");
+    assert_eq!(res["effort"], "medium");
+    assert_eq!(res["modelSource"], "argument");
+
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#6', effort: 'low' })").await);
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-opus-5-5");
+    assert_eq!(res["effort"], "low");
+    assert_eq!(res["modelSource"], "argument");
+
+    // 6. Catalog-only model beyond T3's short list resolves via orchestrator_capabilities search.
+    s.h.fake.set_short_list(1);
+    std::fs::write(
+        repo.join(".t3-workflow.json"),
+        json!({"models": {"ticket": {"provider": "claude-2", "model": "claude-catalog-only", "effort": "high"}}})
+            .to_string(),
+    )
+    .unwrap();
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#7' })").await);
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-catalog-only");
+    assert_eq!(res["effort"], "high");
+    assert_eq!(res["modelSource"], ".t3-workflow.json");
+}
+
+#[tokio::test]
+async fn legacy_board_ticket_keys_sit_below_user_slot_and_above_default() {
+    use t3_codemode::fake::provider;
+
+    let cfg = Config::from_value(json!({
+        "board": {"instanceId": "claude-2", "ticketModel": "claude-haiku-5-5", "ticketEffort": "low"}
+    }))
+    .unwrap();
+    let h = H::build(Vec::new(), cfg);
+    let repo = h.dir.path().join("widgets");
+    std::fs::create_dir_all(&repo).unwrap();
+    h.fake.set_projects(vec![project("p-widgets", &repo.to_string_lossy())]);
+    h.remotes.set(&repo.to_string_lossy(), "git@github.com:acme/widgets.git");
+    h.fake.set_providers(vec![
+        provider("claudeAgent", "claudeAgent", &["claude-opus-5-5", "claude-haiku-5-5"]),
+        provider("claude-2", "claudeAgent", &["claude-opus-5-5", "claude-haiku-5-5"]),
+    ]);
+
+    // With no slot set, legacy board.* keys apply.
+    let res = result(&h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#1' })").await);
+    assert_eq!(res["instanceId"], "claude-2");
+    assert_eq!(res["model"], "claude-haiku-5-5");
+    assert_eq!(res["effort"], "low");
+    assert_eq!(res["modelSource"], "board");
+
+    // Once user config sets models.ticket, it outranks legacy board.* keys.
+    write_workflow_config(
+        &h,
+        json!({"models": {"ticket": {"provider": "claudeAgent", "model": "claude-opus-5-5", "effort": "high"}}}),
+    );
+    let res = result(&h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#2' })").await);
+    assert_eq!(res["instanceId"], "claudeAgent");
+    assert_eq!(res["model"], "claude-opus-5-5");
+    assert_eq!(res["effort"], "high");
+    assert_eq!(res["modelSource"], "user");
+}
+
+#[tokio::test]
+async fn board_launch_picks_through_slot_pool_from_user_config_and_agents_md() {
+    use t3_codemode::fake::provider;
+
+    let cfg = Config::from_value(json!({
+        "pools": {
+            "opus": {
+                "driver": "claudeAgent",
+                "model": "claude-opus-5-5",
+                "effort": "high",
+                "members": [{"instanceId": "claude-a"}, {"instanceId": "claude-b"}]
+            },
+            "frontier": {
+                "mixed": true,
+                "strategy": "priority",
+                "members": [{"instanceId": "codex-a", "model": "gpt-6.2-sol", "effort": "xhigh"}]
+            }
+        }
+    }))
+    .unwrap();
+    let s = start(H::build(Vec::new(), cfg)).await;
+    let repo = s.h.dir.path().join("widgets");
+    std::fs::create_dir_all(&repo).unwrap();
+    s.h.fake.set_projects(vec![project("p-widgets", &repo.to_string_lossy())]);
+    s.h.remotes.set(&repo.to_string_lossy(), "git@github.com:acme/widgets.git");
+    s.h.fake.set_providers(vec![
+        provider("claude-a", "claudeAgent", &["claude-opus-5-5"]),
+        provider("claude-b", "claudeAgent", &["claude-opus-5-5"]),
+        codex_provider("codex-a", &["gpt-6.2-sol"]),
+    ]);
+
+    // User config pool picks via wf.pick and records the pick on the feed.
+    write_workflow_config(&s.h, json!({"models": {"ticket": {"pool": "opus"}}}));
+    let r = s.post("/api/launch", json!({"issues": ["acme/widgets#1", "acme/widgets#2"]}), Some(&s.csrf()), None).await;
+    let body: Value = r.json().await.unwrap();
+    let r1 = &body["results"][0];
+    let r2 = &body["results"][1];
+    assert_eq!(r1["ok"], true, "{r1}");
+    assert_eq!(r1["pool"], "opus");
+    assert_eq!(r1["model"], "claude-opus-5-5");
+    assert_eq!(r1["effort"], "high");
+    assert_eq!(r1["modelSource"], "user");
+    assert!(r1["reason"].as_str().is_some_and(|s| s.contains("claude-opus-5-5")), "{r1}");
+    assert_ne!(r1["instanceId"], r2["instanceId"], "weighted 1:1 alternates pool members");
+    assert!(s.h.app.wf.feed(10).unwrap().iter().any(|f| f["instanceId"] == r1["instanceId"]));
+
+    // Matching effort arg over a non-mixed pool still picks through the pool.
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#4', effort: 'high' })").await);
+    assert_eq!(res["pool"], "opus");
+    assert_eq!(res["modelSource"], "argument");
+    assert!(res["reason"].is_string(), "{res}");
+
+    // Repo AGENTS.md pool overrides user config pool (and an invalid Worker model line does not block tickets).
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: pool `frontier`\n- Worker model: \n")
+        .unwrap();
+    let res = result(&s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#3' })").await);
+    assert_eq!(res["instanceId"], "codex-a");
+    assert_eq!(res["model"], "gpt-6.2-sol");
+    assert_eq!(res["effort"], "xhigh");
+    assert_eq!(res["pool"], "frontier");
+    assert_eq!(res["modelSource"], "AGENTS.md");
+    assert_eq!(
+        s.h.fake.launched()[3]["modelSelection"],
+        json!({"instanceId": "codex-a", "model": "gpt-6.2-sol", "options": [{"id": "reasoningEffort", "value": "xhigh"}]})
+    );
+}
+
+#[tokio::test]
+async fn board_launch_fails_with_error_card_on_invalid_slot_choices_never_falling_back() {
+    use t3_codemode::fake::{disabled_provider, provider};
+
+    let s = start(H::new()).await;
+    let repo = s.h.dir.path().join("widgets");
+    std::fs::create_dir_all(&repo).unwrap();
+    s.h.fake.set_projects(vec![project("p-widgets", &repo.to_string_lossy())]);
+    s.h.remotes.set(&repo.to_string_lossy(), "git@github.com:acme/widgets.git");
+    s.h.fake.set_providers(vec![
+        provider("claudeAgent", "claudeAgent", &["claude-opus-5-5"]),
+        disabled_provider("claude-off", "claudeAgent"),
+    ]);
+
+    let expect_error_card = |res: &Value, needle: &str| {
+        assert_eq!(res["ok"], false, "{res}");
+        assert!(res["card"].is_string(), "{res}");
+        assert!(res["error"].as_str().is_some_and(|e| e.contains(needle)), "expected {needle:?} in {res}");
+    };
+
+    // 1. Instance gone.
+    write_workflow_config(
+        &s.h,
+        json!({"models": {"ticket": {"provider": "claude-gone", "model": "claude-opus-5-5", "effort": "high"}}}),
+    );
+    let body: Value =
+        s.post("/api/launch", json!({"issues": ["acme/widgets#1"]}), Some(&s.csrf()), None).await.json().await.unwrap();
+    expect_error_card(&body["results"][0], "claude-gone");
+
+    // 2. Instance disabled.
+    write_workflow_config(
+        &s.h,
+        json!({"models": {"ticket": {"provider": "claude-off", "model": "claude-opus-5-5", "effort": "high"}}}),
+    );
+    let body: Value =
+        s.post("/api/launch", json!({"issues": ["acme/widgets#2"]}), Some(&s.csrf()), None).await.json().await.unwrap();
+    expect_error_card(&body["results"][0], "claude-off");
+
+    // 3. Model not listed (via AGENTS.md).
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: claude-missing, high effort\n")
+        .unwrap();
+    let out = s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#3' })").await;
+    assert!(err_text(&out).contains("claude-missing"), "{}", out.text);
+
+    // 4. Effort not offered.
+    write_workflow_config(
+        &s.h,
+        json!({"models": {"ticket": {"provider": "claudeAgent", "model": "claude-opus-5-5", "effort": "high"}}}),
+    );
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: claude-opus-5-5, max effort\n")
+        .unwrap();
+    let out = s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#4' })").await;
+    assert!(err_text(&out).contains("effort max is not offered"), "{}", out.text);
+
+    // 5. Unknown pool.
+    std::fs::write(repo.join("AGENTS.md"), "## Agent workflow\n\n- Ticket model: pool `ghost`\n").unwrap();
+    let body: Value =
+        s.post("/api/launch", json!({"issues": ["acme/widgets#5"]}), Some(&s.csrf()), None).await.json().await.unwrap();
+    expect_error_card(&body["results"][0], "no pool \"ghost\"");
+
+    // 6. Broken user workflow config never falls back silently to default.
+    std::fs::remove_file(repo.join("AGENTS.md")).unwrap();
+    std::fs::write(s.h.dir.path().join("home/.config/t3-workflow/config.json"), "{broken json").unwrap();
+    let out = s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#6' })").await;
+    assert!(err_text(&out).contains("workflow config problem"), "{}", out.text);
+
+    // 7. No config and T3 offers no Claude -> fails with error card instead of sending claudeAgent.
+    std::fs::remove_file(s.h.dir.path().join("home/.config/t3-workflow/config.json")).unwrap();
+    s.h.fake.set_providers(vec![codex_provider("codex", &["gpt-6.2-sol"])]);
+    let out = s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#7' })").await;
+    assert!(err_text(&out).contains("no enabled Claude provider"), "{}", out.text);
+
+    // 8. T3 capabilities unreachable -> fails with error card.
+    s.h.fake.set_caps_fail(true);
+    let out = s.h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#8' })").await;
+    assert!(err_text(&out).contains("T3 capabilities unreachable"), "{}", out.text);
+
+    // Nothing launched and no pending links left; every failure left an error card on the board.
+    assert!(s.h.fake.launched().is_empty(), "no thread should launch on invalid choices");
+    assert!(s.h.app.store.pending_all().unwrap().is_empty());
+    let board_cards = cards(&s.h);
+    assert_eq!(board_cards.len(), 8);
+    assert!(board_cards.iter().all(|c| c["kind"] == "error"), "{board_cards:?}");
+
+    // 9. Legacy board.instanceId disabled does not silently switch to another instance of the same driver.
+    let cfg = Config::from_value(json!({"board": {"instanceId": "claudeAgent"}})).unwrap();
+    let h2 = H::build(Vec::new(), cfg);
+    h2.fake.set_projects(vec![project("p-widgets", &repo.to_string_lossy())]);
+    h2.remotes.set(&repo.to_string_lossy(), "git@github.com:acme/widgets.git");
+    h2.fake.set_providers(vec![
+        disabled_provider("claudeAgent", "claudeAgent"),
+        provider("claude-2", "claudeAgent", &["claude-opus-5-5"]),
+    ]);
+    let out = h2.exec("async () => wf.launchTicket({ issue: 'acme/widgets#9' })").await;
+    assert!(err_text(&out).contains("claudeAgent"), "{}", out.text);
+    assert!(h2.fake.launched().is_empty());
+    assert_eq!(cards(&h2).len(), 1);
+    assert_eq!(cards(&h2)[0]["kind"], "error");
+}

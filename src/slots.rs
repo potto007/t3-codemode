@@ -21,9 +21,9 @@ pub const DEFAULT_CLOSE_AFTER: &str = "ticket";
 const DELIVERY_STEP_KEYS: &[&str] = &["id", "kind", "skill", "prompt", "gate", "scope", "paths", "watch"];
 pub const MODEL_ROLES: &[&str] = &["ticket", "worker"];
 const DEFAULT_REVIEW: &str = "sol-loop";
-const DEFAULT_PROVIDER: &str = "claudeAgent";
+pub const DEFAULT_PROVIDER: &str = "claudeAgent";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
-const DEFAULT_EFFORT: &str = "high";
+pub const DEFAULT_EFFORT: &str = "high";
 const REVIEW_SUGGESTION: &str = "sol-loop from https://github.com/t3dotgg/tstack";
 const POOL_NOTE: &str = "t3cm picks the instance at launch with wf.pick";
 
@@ -2057,6 +2057,24 @@ impl Resolved {
         Snapshot::capture_with(i.folders, i.root, i.listed, Some(i.enabled)).build()
     }
 
+    pub fn build_user_only(folders: &Folders) -> Resolved {
+        let config_raw = read_optional(&folders.config);
+        let config_exists = !matches!(config_raw, Ok(None));
+        let snap = Snapshot {
+            fingerprint: String::new(),
+            folders: folders.clone(),
+            root: PathBuf::new(),
+            listed: Vec::new(),
+            config_exists,
+            config_raw,
+            agents_md_raw: Ok(None),
+            repo_config_exists: false,
+            repo_config_raw: Ok(None),
+            skills: Vec::new(),
+        };
+        Resolved::build_from_snapshot(&snap)
+    }
+
     fn build_from_snapshot(s: &Snapshot) -> Resolved {
         let config_file = &s.folders.config;
         let mut config_problems = Vec::new();
@@ -2303,7 +2321,7 @@ fn effort_values(entry: &Value) -> Option<Vec<String>> {
     None
 }
 
-fn check_model(spec: &Map<String, Value>, caps: &Value) -> Option<String> {
+pub fn check_model(spec: &Map<String, Value>, caps: &Value) -> Option<String> {
     let model = spec.get("model").and_then(Value::as_str).unwrap_or_default();
     let provider = spec.get("provider").and_then(Value::as_str);
     let offers = model_offers(caps, model, provider);
@@ -2321,7 +2339,7 @@ fn check_model(spec: &Map<String, Value>, caps: &Value) -> Option<String> {
     None
 }
 
-fn default_model_spec() -> Map<String, Value> {
+pub fn default_model_spec() -> Map<String, Value> {
     [
         ("provider".to_string(), json!(DEFAULT_PROVIDER)),
         ("model".to_string(), json!(DEFAULT_MODEL)),
@@ -2331,7 +2349,7 @@ fn default_model_spec() -> Map<String, Value> {
     .collect()
 }
 
-fn check_default_model(caps: &Value) -> Option<String> {
+pub fn check_default_model(caps: &Value) -> Option<String> {
     let offers = model_offers(caps, DEFAULT_MODEL, Some(DEFAULT_PROVIDER));
     if offers.is_empty() {
         return Some(format!("T3 offers no enabled provider with model {DEFAULT_MODEL} on {DEFAULT_PROVIDER}"));

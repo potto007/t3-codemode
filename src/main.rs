@@ -706,6 +706,7 @@ async fn run_doctor(a: DoctorArgs) -> Result<ExitCode> {
     let (cfg, found) = doctor::t3cm_config(&config::default_path());
     f.extend(found);
     f.extend(doctor::pools(&eff, cfg.as_ref()));
+    f.extend(doctor::legacy_board(cfg.as_ref()));
     let home = t3_codemode::drift::Home::from_env()?;
     let bundle = skills::Bundle::embedded();
     f.extend(doctor::skills(&home, &bundle));

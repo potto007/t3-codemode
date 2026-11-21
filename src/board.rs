@@ -10,6 +10,7 @@ use crate::contexts::ProjectFilter;
 use crate::issues::issue_key;
 use crate::pools::Picked;
 use crate::reconcile::{CardPr, card_pr};
+use crate::slots::{self, Caps, REPO_CONFIG_FILE};
 use crate::store::{Link, Pending};
 use crate::t3::{BoxFut, truncate_chars};
 use crate::wf::{ACTIVE, ENDED_BADLY, WATCHER, Wf, capped, count, header};
@@ -331,6 +332,30 @@ pub struct LaunchArgs {
     pub title: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+enum BaseSpec {
+    Pool { pool: String, source: String },
+    Model { provider: Option<String>, model: String, effort: Option<String>, source: String, exact_instance: bool },
+    Default,
+}
+
+struct ResolvedLaunch {
+    selection: Value,
+    instance_id: String,
+    model: String,
+    effort: Option<String>,
+    source: String,
+    picked: Option<Picked>,
+}
+
+fn effort_from_selection(selection: &Value) -> Option<String> {
+    selection["options"].as_array().and_then(|opts| {
+        opts.iter()
+            .find(|o| o["id"].as_str().is_some_and(|i| slots::EFFORT_OPTIONS.contains(&i)))
+            .and_then(|o| o["value"].as_str())
+            .map(String::from)
+    })
 }
 
 pub(crate) fn random_id() -> String {
@@ -916,27 +941,263 @@ impl Wf {
         Ok(None)
     }
 
-    async fn pool_pick(&self, model: Option<&str>, effort: Option<&str>) -> Result<Option<Picked>> {
+    async fn ask_pool_pick(&self) -> Result<Option<Picked>> {
         let Some(name) = &self.config.board.pool else { return Ok(None) };
-        let pool = self.pool(name)?;
-        if pool.mixed
-            && let Some(what) = model.map(|m| format!("model {m}")).or(effort.map(|e| format!("effort {e}")))
-        {
-            bail!(
-                "board.pool {name} is a mixed pool, where each member runs its own model and effort; launch without a model or effort, or unset board.pool to launch {what}"
-            );
-        }
-        let pooled = pool.model.as_deref().unwrap_or_default();
-        if let Some(m) = model.filter(|m| *m != pooled) {
-            bail!("board.pool {name} runs {pooled}; launch without a model, or unset board.pool to launch {m}");
-        }
-        if let Some(e) = effort.filter(|e| Some(*e) != pool.effort.as_deref()) {
-            bail!(
-                "board.pool {name} runs effort {}; launch without an effort, or unset board.pool to launch effort {e}",
-                pool.effort.as_deref().unwrap_or("default")
-            );
-        }
         Ok(Some(self.pick(name).await?))
+    }
+
+    async fn resolve_specific_model(
+        &self,
+        provider: Option<String>,
+        model: String,
+        effort: Option<String>,
+        exact_instance: bool,
+        hint: Option<String>,
+        source: String,
+    ) -> Result<ResolvedLaunch> {
+        let mut spec = serde_json::Map::new();
+        spec.insert("model".into(), json!(model));
+        if let Some(p) = &provider {
+            spec.insert("provider".into(), json!(p));
+        }
+        if let Some(e) = &effort {
+            spec.insert("effort".into(), json!(e));
+        }
+        let caps = self.caps_for_spec(Some(&spec), exact_instance).await;
+        let caps_val = match &caps {
+            Caps::Got(v) => v,
+            Caps::Failed(e) => bail!("T3 capabilities unreachable: {e}"),
+            Caps::Unchecked => bail!("T3 capabilities not checked"),
+        };
+        if let Some(problem) = slots::check_model(&spec, caps_val) {
+            bail!("{problem}");
+        }
+        let selection = crate::wf_slots::model_selection(&json!({"spec": spec}), hint.as_deref(), &caps);
+        let Some(instance_id) = selection["instanceId"].as_str().map(String::from) else {
+            bail!("T3 offers no enabled provider with model {model}");
+        };
+        let effort_out = effort_from_selection(&selection);
+        Ok(ResolvedLaunch { selection, instance_id, model, effort: effort_out, source, picked: None })
+    }
+
+    async fn resolve_ticket_model(
+        &self,
+        workspace_root: Option<&str>,
+        model_arg: Option<&str>,
+        effort_arg: Option<&str>,
+    ) -> Result<ResolvedLaunch> {
+        let resolved = self.resolve_project_slots(workspace_root).await?;
+        if model_arg.is_none() {
+            let model_problems: Vec<String> = resolved
+                .problems()
+                .into_iter()
+                .filter(|p| p.contains("models.ticket") || p.contains(".models:") || p.contains("AGENTS.md models:"))
+                .collect();
+            if !model_problems.is_empty() {
+                bail!("{}", model_problems.join("; "));
+            }
+            if !resolved.config_problems.is_empty() {
+                bail!("workflow config problem: {}", resolved.config_problems.join("; "));
+            }
+            let repo_json_problems: Vec<&str> =
+                resolved.repo_problems.iter().filter(|p| p.contains(REPO_CONFIG_FILE)).map(String::as_str).collect();
+            if !repo_json_problems.is_empty() {
+                bail!("repo workflow config problem: {}", repo_json_problems.join("; "));
+            }
+        }
+
+        let ticket_slot = resolved.models.iter().find(|m| m.role == "ticket");
+        let base = match ticket_slot {
+            Some(slot) if slot.source != "default" => match &slot.spec {
+                Some(s) if s.contains_key("pool") => {
+                    let pool = s
+                        .get("pool")
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.trim().is_empty())
+                        .ok_or_else(|| anyhow!("models.ticket ({}) names an empty pool", slot.source))?;
+                    BaseSpec::Pool { pool: pool.to_string(), source: slot.source.clone() }
+                }
+                Some(s) => {
+                    let model = s
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.trim().is_empty())
+                        .ok_or_else(|| anyhow!("models.ticket ({}) names no model", slot.source))?;
+                    let provider =
+                        s.get("provider").and_then(Value::as_str).filter(|p| !p.trim().is_empty()).map(String::from);
+                    let effort =
+                        s.get("effort").and_then(Value::as_str).filter(|e| !e.trim().is_empty()).map(String::from);
+                    BaseSpec::Model {
+                        provider,
+                        model: model.to_string(),
+                        effort,
+                        source: slot.source.clone(),
+                        exact_instance: false,
+                    }
+                }
+                None => bail!("models.ticket ({}) names no model or pool", slot.source),
+            },
+            _ => {
+                let b = &self.config.board;
+                if let Some(pool) = &b.pool {
+                    BaseSpec::Pool { pool: pool.clone(), source: "board".into() }
+                } else if b.has_legacy_ticket_keys() {
+                    let exact_instance = b.has_legacy_ticket_key("instanceId");
+                    let provider = if exact_instance || !b.has_legacy_ticket_key("ticketModel") {
+                        Some(b.instance_id.clone())
+                    } else {
+                        None
+                    };
+                    let effort = if b.has_legacy_ticket_key("ticketEffort") || b.ticket_model == slots::DEFAULT_MODEL {
+                        b.ticket_effort.clone()
+                    } else {
+                        None
+                    };
+                    BaseSpec::Model {
+                        provider,
+                        model: b.ticket_model.clone(),
+                        effort,
+                        source: "board".into(),
+                        exact_instance,
+                    }
+                } else {
+                    BaseSpec::Default
+                }
+            }
+        };
+
+        match (model_arg, effort_arg) {
+            (None, None) => match base {
+                BaseSpec::Pool { pool, source } => {
+                    let p = self.pick(&pool).await?;
+                    Ok(ResolvedLaunch {
+                        selection: p.model_selection.clone(),
+                        instance_id: p.instance_id.clone(),
+                        model: p.model.clone(),
+                        effort: p.effort.clone(),
+                        source,
+                        picked: Some(p),
+                    })
+                }
+                BaseSpec::Model { provider, model, effort, source, exact_instance } => {
+                    let hint = if !exact_instance && source == "board" {
+                        Some(self.config.board.instance_id.clone())
+                    } else {
+                        None
+                    };
+                    self.resolve_specific_model(provider, model, effort, exact_instance, hint, source).await
+                }
+                BaseSpec::Default => {
+                    let caps = self.caps_for_spec(None, false).await;
+                    let caps_val = match &caps {
+                        Caps::Got(v) => v,
+                        Caps::Failed(e) => bail!("T3 capabilities unreachable: {e}"),
+                        Caps::Unchecked => bail!("T3 capabilities not checked"),
+                    };
+                    if slots::model_offers(caps_val, slots::DEFAULT_MODEL, Some(slots::DEFAULT_PROVIDER)).is_empty() {
+                        bail!(
+                            "no ticket model is configured and T3 offers no enabled Claude provider with {}; set models.ticket with setup-t3-workflow",
+                            slots::DEFAULT_MODEL
+                        );
+                    }
+                    if let Some(problem) = slots::check_default_model(caps_val) {
+                        bail!("{problem}");
+                    }
+                    let spec = slots::default_model_spec();
+                    let selection = crate::wf_slots::model_selection(&json!({"spec": spec}), None, &caps);
+                    let Some(instance_id) = selection["instanceId"].as_str().map(String::from) else {
+                        bail!("T3 offers no enabled provider with model {}", slots::DEFAULT_MODEL);
+                    };
+                    let effort_out = effort_from_selection(&selection);
+                    Ok(ResolvedLaunch {
+                        selection,
+                        instance_id,
+                        model: slots::DEFAULT_MODEL.into(),
+                        effort: effort_out,
+                        source: "default".into(),
+                        picked: None,
+                    })
+                }
+            },
+            (Some(model), effort_arg) => {
+                let (provider, effort, exact_instance, hint) = match base {
+                    BaseSpec::Model { provider, model: base_model, effort: base_effort, exact_instance, .. }
+                        if model == base_model =>
+                    {
+                        (provider, effort_arg.map(String::from).or(base_effort), exact_instance, None)
+                    }
+                    BaseSpec::Model { provider, .. } => (None, effort_arg.map(String::from), false, provider),
+                    BaseSpec::Pool { .. } | BaseSpec::Default => (None, effort_arg.map(String::from), false, None),
+                };
+                self.resolve_specific_model(
+                    provider,
+                    model.to_string(),
+                    effort,
+                    exact_instance,
+                    hint,
+                    "argument".into(),
+                )
+                .await
+            }
+            (None, Some(effort)) => match base {
+                BaseSpec::Model { provider, model, exact_instance, source, .. } => {
+                    let hint = if !exact_instance && source == "board" {
+                        Some(self.config.board.instance_id.clone())
+                    } else {
+                        None
+                    };
+                    self.resolve_specific_model(
+                        provider,
+                        model,
+                        Some(effort.to_string()),
+                        exact_instance,
+                        hint,
+                        "argument".into(),
+                    )
+                    .await
+                }
+                BaseSpec::Default => {
+                    self.resolve_specific_model(
+                        Some(slots::DEFAULT_PROVIDER.into()),
+                        slots::DEFAULT_MODEL.into(),
+                        Some(effort.to_string()),
+                        false,
+                        None,
+                        "argument".into(),
+                    )
+                    .await
+                }
+                BaseSpec::Pool { pool, .. } => {
+                    let cfg = self.pool(&pool)?;
+                    if cfg.mixed {
+                        bail!(
+                            "pool {pool} is a mixed pool, where each member runs its own model and effort; pass a model with effort {effort}, or launch without an effort"
+                        );
+                    }
+                    if cfg.effort.as_deref() == Some(effort) {
+                        let p = self.pick(&pool).await?;
+                        return Ok(ResolvedLaunch {
+                            selection: p.model_selection.clone(),
+                            instance_id: p.instance_id.clone(),
+                            model: p.model.clone(),
+                            effort: p.effort.clone(),
+                            source: "argument".into(),
+                            picked: Some(p),
+                        });
+                    }
+                    let model = cfg.model.clone().unwrap_or_default();
+                    self.resolve_specific_model(
+                        cfg.driver.clone(),
+                        model,
+                        Some(effort.to_string()),
+                        false,
+                        None,
+                        "argument".into(),
+                    )
+                    .await
+                }
+            },
+        }
     }
 
     fn note_pool_launch(&self, out: &mut Value, picked: &Picked, what: &str, thread: &str) {
@@ -1004,6 +1265,7 @@ impl Wf {
             }
         };
         let project_id = project["id"].as_str().unwrap_or_default().to_string();
+        let workspace_root = project["workspaceRoot"].as_str().filter(|s| !s.is_empty());
         let repo = match identity_repo(&project) {
             Some(r) => Some(r),
             None => self.origin_repo(&project).await,
@@ -1011,10 +1273,11 @@ impl Wf {
         if let Some(repo) = repo {
             self.remember_project(&project_id, &project["title"], Some(repo));
         }
-        let picked = match self.pool_pick(model_arg.as_deref(), effort_arg.as_deref()).await {
-            Ok(p) => p,
-            Err(e) => return self.launch_failed(&label, &format!("Cannot launch {label}: {e:#}")),
-        };
+        let resolved =
+            match self.resolve_ticket_model(workspace_root, model_arg.as_deref(), effort_arg.as_deref()).await {
+                Ok(r) => r,
+                Err(e) => return self.launch_failed(&label, &format!("Cannot launch {label}: {e:#}")),
+            };
         let params = self.config.link_params("overseer", "ticket")?;
         {
             let _g = self.lock.lock().await;
@@ -1033,17 +1296,10 @@ impl Wf {
         self.changed();
         let b = &self.config.board;
         let title = format!("{label}: {}", nonempty(a.title).unwrap_or_else(|| issue.url()));
-        let selection = match &picked {
-            Some(p) => p.model_selection.clone(),
-            None => {
-                let effort = effort_arg.or_else(|| b.ticket_effort.clone());
-                self.model_selection(&model_arg.unwrap_or_else(|| b.ticket_model.clone()), effort.as_deref())
-            }
-        };
         let mut input = json!({
             "projectId": project_id,
             "title": title,
-            "modelSelection": selection,
+            "modelSelection": resolved.selection,
             "message": ticket_brief(&issue.url(), &label),
             "clientRequestId": format!("t3cm-board-{}", random_id()),
         });
@@ -1086,8 +1342,20 @@ impl Wf {
         if let Err(e) = self.store.new_issue_remove(&issue_key(&issue)) {
             tracing::warn!("{label} launched, but taking it off the new issues failed: {e:#}");
         }
-        let mut out = json!({"ok": true, "label": label, "thread": thread, "link": link, "projectId": project_id, "title": title});
-        if let Some(p) = &picked {
+        let mut out = json!({
+            "ok": true,
+            "label": label,
+            "thread": thread,
+            "link": link,
+            "projectId": project_id,
+            "title": title,
+            "instanceId": resolved.instance_id,
+            "model": resolved.model,
+            "effort": resolved.effort,
+            "modelSource": resolved.source,
+        });
+        if let Some(p) = &resolved.picked {
+            out["pool"] = json!(p.pool);
             self.note_pool_launch(&mut out, p, &label, &thread);
         }
         self.changed();
@@ -1103,7 +1371,7 @@ impl Wf {
             bail!("the question is over {MAX_TEXT} chars");
         }
         let b = &self.config.board;
-        let picked = match self.pool_pick(None, None).await {
+        let picked = match self.ask_pool_pick().await {
             Ok(p) => p,
             Err(e) => {
                 let text = format!("Cannot ask the board question: {e:#}");

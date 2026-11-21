@@ -58,8 +58,8 @@ and the threads running. Only the lists scroll.
   of them, under the ticket and worker that sent them. Runs from the same
   sender fold into one row that expands. The board drops kind prefixes and
   `Publishing:` tails, and shortens hashes to 7 characters and GitHub links to
-  `#65`. With `board.pool` set, each launch adds an entry that names the
-  instance it went to and why.
+  `#65`. When a launch picks from a pool in `models.ticket` or `board.pool`,
+  each launch adds an entry that names the instance it went to and why.
 - **Launch and Ask,** pinned above Activity. Launch takes GitHub issue URLs and
   makes each one a ticket thread. A question in Ask starts a short-lived Haiku
   thread that reads the board, writes its answer under Ask, and then gets
@@ -253,19 +253,30 @@ async () => (await wf.cards({ context: "Widget work" })).map(c => `${c.id} ${c.r
 ```
 
 `wf.launchTicket` finds the T3 project whose workspace `origin` remote is the
-issue's GitHub repo, unless `project` names one, and launches a thread that
-works the issue and reports to the board. An unmapped repo or a failed launch
-throws and leaves an error card. The launched thread is told to use the
-`t3-ticket` skill, which lives in this repo's `skills/` folder and is installed
-as an agent skill, apart from the service.
+issue's GitHub repo, unless `project` names one, resolves `models.ticket` for
+that project through the service's slot resolver, and launches a thread that
+works the issue and reports to the board. Precedence for the launch model is:
+
+1. `model` or `effort` passed to `wf.launchTicket`, reported as `modelSource: "argument"`.
+2. The repository's `.t3-workflow.json` or `AGENTS.md`, reported as `".t3-workflow.json"` or `"AGENTS.md"`.
+3. The user config's `models.ticket`, reported as `"user"`.
+4. Legacy `board.instanceId`, `ticketModel`, `ticketEffort` and `pool` in
+   t3cm's config, reported as `"board"`.
+5. The built-in default, reported as `"default"`.
+
+The result always carries `instanceId`, `model`, `effort`, which is `null` when
+none applies, and `modelSource`. When the resolved choice is a
+[pool](config.md#pools) in `models.ticket` or legacy `board.pool`, the launch
+picks a provider instance through `wf.pick`, adds `pool` and `reason` to the
+result, and logs a feed entry with `instanceId` and `reason`. Every launch
+checks its choice against T3's `orchestrator_capabilities`. An unmapped repo, a
+missing or disabled instance, an unlisted model, an unsupported effort, an
+unknown or exhausted pool, or a failed launch throws and leaves an error card,
+never falling back to the built-in default. The launched thread is told to use
+the `t3-ticket` skill, which lives in this repo's `skills/` folder and is
+installed as an agent skill, apart from the service.
 [The workflow skills](getting-started.md#the-workflow-skills) covers installing
 them. Without the skills installed, launched threads do not know the workflow.
-
-With [`board.pool`](config.md#pools) set, each launch from the board picks its
-provider instance from that pool in place of `board.instanceId`. The result
-carries `instanceId` and `reason`, and the feed entry for the launch carries
-the same two fields. When no member of the pool can run, the launch fails,
-leaves an error card that names the pool, and launches nothing.
 
 ## New issues
 

@@ -297,6 +297,61 @@ impl Wf {
         Ok(if skill_tool { r } else { r.without_skill_tool() })
     }
 
+    pub(crate) async fn resolve_project_slots(&self, workspace_root: Option<&str>) -> Result<Resolved> {
+        match workspace_root.filter(|r| !r.trim().is_empty()) {
+            Some(r) => {
+                let ctx = self.slot_ctx(None, &Reported::default(), Some(r), None).await?;
+                self.resolve_slots(&ctx, &[]).await
+            }
+            None => {
+                let folders = self.base_folders()?;
+                Ok(tokio::task::spawn_blocking(move || Resolved::build_user_only(&folders)).await?)
+            }
+        }
+    }
+
+    pub(crate) async fn caps_for_spec(
+        &self,
+        spec: Option<&serde_json::Map<String, Value>>,
+        exact_instance: bool,
+    ) -> Caps {
+        let mut base = match self.t3.call("orchestrator_capabilities", json!({})).await {
+            Ok(v) => v,
+            Err(e) => return Caps::Failed(e.to_string()),
+        };
+        let scoped = |caps: &Value| -> Value {
+            let Some(id) =
+                exact_instance.then(|| spec.and_then(|s| s.get("provider")).and_then(Value::as_str)).flatten()
+            else {
+                return caps.clone();
+            };
+            let providers: Vec<Value> = caps["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["providerInstanceId"].as_str() == Some(id))
+                .cloned()
+                .collect();
+            json!({"providers": providers})
+        };
+        let check = scoped(&base);
+        let search = match spec {
+            None => slots::default_model_needs_search(&check).then(|| slots::DEFAULT_MODEL.to_string()),
+            Some(s) if s.contains_key("pool") => None,
+            Some(s) => s
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|_| slots::model_needs_search(s, &check))
+                .map(String::from),
+        };
+        if let Some(model) = search
+            && let Ok(extra) = self.t3.call("orchestrator_capabilities", json!({"search": model})).await
+        {
+            slots::merge_caps(&mut base, &extra);
+        }
+        Caps::Got(scoped(&base))
+    }
+
     async fn caps_for(&self, r: &Resolved) -> Caps {
         let mut base = match self.t3.call("orchestrator_capabilities", json!({})).await {
             Ok(v) => v,
@@ -389,7 +444,7 @@ fn with_how(e: &Value) -> Value {
     e
 }
 
-fn model_selection(m: &Value, instance: Option<&str>, caps: &Caps) -> Value {
+pub(crate) fn model_selection(m: &Value, instance: Option<&str>, caps: &Caps) -> Value {
     let spec = &m["spec"];
     if let Some(pool) = spec["pool"].as_str() {
         return json!({"pool": pool, "pick": format!("wf.pick({{ pool: {pool:?} }}) gives the modelSelection")});
@@ -407,7 +462,10 @@ fn model_selection(m: &Value, instance: Option<&str>, caps: &Caps) -> Value {
     let offers = slots::model_offers(caps, model, spec["provider"].as_str());
     let fitting: Vec<&(String, Value)> = offers.iter().filter(|(_, e)| option_of(e).is_some()).collect();
     let pool: Vec<&(String, Value)> = if fitting.is_empty() { offers.iter().collect() } else { fitting };
-    let pick = pool.iter().find(|(id, _)| Some(id.as_str()) == instance);
+    let pick = pool
+        .iter()
+        .find(|(id, _)| Some(id.as_str()) == instance)
+        .or_else(|| spec["provider"].as_str().and_then(|p| pool.iter().find(|(id, _)| id == p)));
     let Some((id, entry)) = pick.or(pool.first()).copied() else { return Value::Null };
     let mut sel = json!({"instanceId": id, "model": model});
     if let Some(o) = option_of(entry) {

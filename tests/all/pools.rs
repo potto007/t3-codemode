@@ -302,11 +302,14 @@ async fn the_feed_shows_which_instance_a_pool_launch_went_to() {
 }
 
 #[tokio::test]
-async fn a_pool_launch_refuses_a_different_model() {
+async fn a_launch_arg_model_overrides_legacy_board_pool() {
     let h = pooled("weighted", two(1, 1));
     let out = h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#1', model: 'claude-haiku-5-5' })").await;
-    assert!(err_text(&out).contains("board.pool opus runs claude-opus-5-5"), "{}", out.text);
-    assert!(h.fake.launched().is_empty());
+    let r = result(&out);
+    assert_eq!(r["model"], "claude-haiku-5-5");
+    assert_eq!(r["modelSource"], "argument");
+    assert!(r.get("pool").is_none() && r.get("reason").is_none(), "{r}");
+    assert_eq!(h.fake.launched()[0]["modelSelection"]["model"], "claude-haiku-5-5");
 }
 
 #[tokio::test]
@@ -328,18 +331,21 @@ async fn limits_credits_and_pick_history_survive_a_restart() {
 }
 
 #[tokio::test]
-async fn no_pool_set_launches_exactly_as_before() {
+async fn no_pool_set_launches_with_default_slot_and_reports_model_and_source() {
     let h = H::new();
     h.fake.set_projects(vec![project("p-widgets", "/src/widgets")]);
     h.remotes.set("/src/widgets", "git@github.com:acme/widgets.git");
     let r = launch(&h, 1).await;
-    assert!(r.get("instanceId").is_none() && r.get("reason").is_none(), "{r}");
+    assert_eq!(r["instanceId"], "claudeAgent");
+    assert_eq!(r["model"], OPUS);
+    assert_eq!(r["effort"], "high");
+    assert_eq!(r["modelSource"], "default");
+    assert!(r.get("pool").is_none() && r.get("reason").is_none(), "{r}");
     let l = &h.fake.launched()[0];
     assert_eq!(
         l["modelSelection"],
         json!({"instanceId": "claudeAgent", "model": OPUS, "options": [{"id": "effort", "value": "high"}]})
     );
-    assert!(!h.fake.calls().iter().any(|c| c == "orchestrator_capabilities"));
     assert!(h.app.wf.feed(10).unwrap().is_empty());
 }
 
@@ -965,17 +971,23 @@ async fn wf_pools_shows_each_members_driver_model_and_effort() {
 }
 
 #[tokio::test]
-async fn a_mixed_board_pool_launches_on_the_members_model_and_refuses_one_named() {
+async fn a_mixed_board_pool_launches_on_the_members_model_and_overrides_or_rejects_args() {
     let h = mixed(claude_and_codex(), true);
     let r = launch(&h, 1).await;
     let id = r["instanceId"].as_str().unwrap();
     let model = if id == "claude-a" { OPUS } else { ASTRA };
     assert_eq!(h.fake.launched()[0]["modelSelection"]["model"], model);
+    assert_eq!(r["model"], model);
+    assert_eq!(r["pool"], "frontier");
+    assert_eq!(r["modelSource"], "board");
     let out = h.exec(&format!("async () => wf.launchTicket({{ issue: 'acme/widgets#2', model: '{OPUS}' }})")).await;
-    assert!(err_text(&out).contains("board.pool frontier is a mixed pool"), "{}", out.text);
+    let r2 = result(&out);
+    assert_eq!(r2["model"], OPUS);
+    assert_eq!(r2["modelSource"], "argument");
+    assert!(r2.get("pool").is_none(), "{r2}");
     let out = h.exec("async () => wf.launchTicket({ issue: 'acme/widgets#3', effort: 'high' })").await;
-    assert!(err_text(&out).contains("unset board.pool to launch effort high"), "{}", out.text);
-    assert_eq!(h.fake.launched().len(), 1);
+    assert!(err_text(&out).contains("pool frontier is a mixed pool"), "{}", out.text);
+    assert_eq!(h.fake.launched().len(), 2);
 }
 
 #[test]

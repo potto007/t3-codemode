@@ -13,6 +13,7 @@ pub const CLOSING: &[&str] = &["handoff", "closed"];
 const EXTRA_WAKE_KINDS: &[&str] = &["escalate", "reply"];
 
 pub const MAX_LIMIT_HOLD_MINUTES: u64 = 7 * 24 * 60;
+pub const LEGACY_BOARD_TICKET_KEYS: &[&str] = &["instanceId", "ticketModel", "ticketEffort", "pool"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 
@@ -71,6 +72,18 @@ pub struct BoardConfig {
     pub reconcile_active_minutes: u64,
     pub reconcile_idle_minutes: u64,
     pub open_links: OpenLinks,
+    #[serde(skip)]
+    pub legacy_ticket_keys: Vec<String>,
+}
+
+impl BoardConfig {
+    pub fn has_legacy_ticket_keys(&self) -> bool {
+        !self.legacy_ticket_keys.is_empty()
+    }
+
+    pub fn has_legacy_ticket_key(&self, key: &str) -> bool {
+        self.legacy_ticket_keys.iter().any(|k| k == key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +204,21 @@ impl Config {
     }
 
     pub fn from_value(over: Value) -> Result<Config> {
+        let legacy_ticket_keys = over
+            .get("board")
+            .and_then(Value::as_object)
+            .map(|b| {
+                LEGACY_BOARD_TICKET_KEYS
+                    .iter()
+                    .filter(|&&k| match b.get(k) {
+                        Some(v) if k == "pool" => !v.is_null(),
+                        Some(_) => true,
+                        None => false,
+                    })
+                    .map(|&k| k.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut v = builtin_defaults();
         if !over.is_null() {
             merge(&mut v, over);
@@ -201,7 +229,8 @@ impl Config {
                 crate::pools::check_value(name, raw)?;
             }
         }
-        let cfg: Config = serde_json::from_value(v)?;
+        let mut cfg: Config = serde_json::from_value(v)?;
+        cfg.board.legacy_ticket_keys = legacy_ticket_keys;
         cfg.validate()?;
         Ok(cfg)
     }

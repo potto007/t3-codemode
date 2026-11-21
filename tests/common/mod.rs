@@ -7,7 +7,7 @@ use t3_codemode::app::{App, ExecuteRequest, ToolOutput};
 use t3_codemode::clock::FakeClock;
 use t3_codemode::config::Config;
 use t3_codemode::drift::Home;
-use t3_codemode::fake::{FakeDesktop, FakeGitHub, FakeRemotes, FakeT3, thread};
+use t3_codemode::fake::{FakeDesktop, FakeGitHub, FakeRemotes, FakeT3, provider, thread};
 use t3_codemode::store::Store;
 
 pub const BOSS: &str = "mcp:boss";
@@ -51,6 +51,7 @@ impl H {
         for id in [BOSS, TICKET, WORKER] {
             fake.put(thread(id, "idle", T0));
         }
+        fake.set_providers(vec![provider("claudeAgent", "claudeAgent", &["claude-opus-5-5", "claude-haiku-5-5"])]);
         let clock = Arc::new(FakeClock::at(T0));
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let remotes = Arc::new(FakeRemotes::default());

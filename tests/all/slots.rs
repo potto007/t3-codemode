@@ -1088,3 +1088,75 @@ fn doctor_validates_repo_workflow_json_and_surfaces_skipped_or_bad_delivery_step
     assert_eq!(v["settings"]["delivery"]["source"], "default");
     assert_eq!(v["settings"]["delivery"]["steps"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn doctor_warns_when_legacy_board_ticket_keys_are_set() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let cfg_path = home.path().join("t3cm.json");
+
+    // Non-legacy board keys and null pool produce no legacy ticket warning.
+    std::fs::write(&cfg_path, json!({"board": {"settleAfterHours": 48, "pool": null}}).to_string()).unwrap();
+    let out = t3cm(home.path())
+        .env("T3CM_CONFIG", &cfg_path)
+        .args(["doctor", "--no-t3", "--json", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings: Vec<&str> = v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(!warnings.iter().any(|w| w.contains("legacy ticket launch")), "{warnings:?}");
+
+    // Setting legacy board ticket keys emits a warning pointing to models.ticket without failing doctor.
+    std::fs::write(
+        &cfg_path,
+        json!({
+            "pools": {
+                "opus": {
+                    "driver": "claudeAgent",
+                    "model": "claude-opus-5-5",
+                    "members": [{"instanceId": "claude-a"}]
+                }
+            },
+            "board": {
+                "instanceId": "claude-2",
+                "ticketModel": "claude-opus-5-5",
+                "ticketEffort": "medium",
+                "pool": "opus"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = t3cm(home.path())
+        .env("T3CM_CONFIG", &cfg_path)
+        .args(["doctor", "--no-t3", "--json", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings: Vec<&str> = v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let legacy = warnings.iter().find(|w| w.contains("legacy ticket launch")).expect("legacy board warning");
+    for key in ["board.instanceId", "board.ticketModel", "board.ticketEffort", "board.pool", "models.ticket"] {
+        assert!(legacy.contains(key), "missing {key} in {legacy}");
+    }
+    assert!(legacy.contains("ask box"), "expected ask-box caveat for instanceId/pool: {legacy}");
+
+    // When only ticketModel/ticketEffort are set, doctor advises moving them without the ask-box caveat.
+    std::fs::write(&cfg_path, json!({"board": {"ticketModel": "claude-opus-5-5"}}).to_string()).unwrap();
+    let out = t3cm(home.path())
+        .env("T3CM_CONFIG", &cfg_path)
+        .args(["doctor", "--no-t3", "--json", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings: Vec<&str> = v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let legacy = warnings.iter().find(|w| w.contains("legacy ticket launch")).expect("legacy board warning");
+    assert!(legacy.contains("board.ticketModel") && legacy.contains("move it into the models.ticket slot"), "{legacy}");
+    assert!(!legacy.contains("ask box"), "{legacy}");
+}

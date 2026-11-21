@@ -136,6 +136,36 @@ pub fn pools(eff: &Value, cfg: Option<&Config>) -> Findings {
     f
 }
 
+pub fn legacy_board(cfg: Option<&Config>) -> Findings {
+    let mut f = Findings::default();
+    let Some(cfg) = cfg else { return f };
+    let keys = &cfg.board.legacy_ticket_keys;
+    if !keys.is_empty() {
+        let names: Vec<String> = keys.iter().map(|k| format!("board.{k}")).collect();
+        let ask_keys: Vec<String> =
+            keys.iter().filter(|k| matches!(k.as_str(), "instanceId" | "pool")).map(|k| format!("board.{k}")).collect();
+        let (verb, pron) = if names.len() == 1 {
+            ("is a legacy ticket launch setting", "it")
+        } else {
+            ("are legacy ticket launch settings", "them")
+        };
+        let tail = if ask_keys.is_empty() {
+            format!(
+                "move {pron} into the models.ticket slot (run setup-t3-workflow or edit ~/.config/t3-workflow/config.json)"
+            )
+        } else {
+            let (ask_pron, ask_verb) =
+                if ask_keys.len() == 1 { ("it", "still configures") } else { ("them", "still configure") };
+            let ask_list = ask_keys.join(" and ");
+            format!(
+                "set the models.ticket slot instead (run setup-t3-workflow or edit ~/.config/t3-workflow/config.json), which takes precedence for tickets; keep {ask_list} if you use {ask_pron} for the ask box ({ask_list} {ask_verb} the ask box)",
+            )
+        };
+        f.warnings.push(format!("t3cm config: {} {verb}; {tail}", names.join(", ")));
+    }
+    f
+}
+
 pub fn service(health: Option<&Value>, unreachable: Option<&str>) -> Findings {
     let mut f = Findings::default();
     match (health, unreachable) {

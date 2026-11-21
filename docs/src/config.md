@@ -72,10 +72,10 @@ All under `board`:
 
 | Key | Default | Does |
 |---|---|---|
-| `ticketModel`, `ticketEffort` | `claude-opus-5-5`, `high` | Model and effort for ticket threads the board launches |
+| `ticketModel`, `ticketEffort` | `claude-opus-5-5`, `high` | Legacy fallback for ticket launches when `models.ticket` is unset in repo and user workflow configs. Move these into `models.ticket`; `t3cm doctor` warns when they are set. |
 | `askModel`, `askEffort` | `claude-haiku-5-5`, unset | Model and effort for the ask box's scratch threads |
-| `instanceId` | `claudeAgent` | The T3 provider instance launches use |
-| `pool` | unset | A pool from `pools` that picks the instance for each launch in place of `instanceId`. See [Pools](#pools). |
+| `instanceId` | `claudeAgent` | Legacy fallback T3 provider instance for ticket launches when `models.ticket` is unset, and the default instance for the ask box. `t3cm doctor` warns when it is set and notes that it still applies to the ask box. |
+| `pool` | unset | Legacy fallback pool from `pools` for ticket launches when `models.ticket` is unset, and the pool for the ask box. Set ticket pools in `models.ticket` and keep `board.pool` if the ask box uses it; `t3cm doctor` warns when it is set. See [Pools](#pools). |
 | `runtimeMode` | `full-access` | Runtime mode for launches. The service has no thread to inherit a mode from. |
 | `askPollSecs` | `4` | How often an open ask is checked for its answer |
 | `askTimeoutMinutes` | `15` | How long an ask may run |
@@ -225,9 +225,9 @@ rejects one that sets them. Every member needs a `model`. t3cm does not group
 models into tiers on its own, so a new model joins a tier when you add it to
 the pool. The same instance can be a member of several pools, each with its
 own model. Weights and credits are per pool, and a usage limit benches the
-instance in every pool it belongs to. With a mixed `board.pool`, a
-`wf.launchTicket` call that names a model or effort fails, since the member
-picked sets both. [ADR 0005](https://github.com/OttoOps/t3-codemode/blob/main/docs/adr/0005-tiers-are-mixed-pools.md)
+instance in every pool it belongs to. With a mixed pool active for a board
+launch, passing `model` to `wf.launchTicket` overrides the pool, while passing
+`effort` alone fails since each member runs its own model. [ADR 0005](https://github.com/OttoOps/t3-codemode/blob/main/docs/adr/0005-tiers-are-mixed-pools.md)
 records why tiers work this way.
 
 #### Limits
@@ -257,12 +257,15 @@ Marks live in `store.db`, so they survive a restart. `wf.pools()` shows each
 mark's reset time and the thread that set it. [ADR 0001](https://github.com/OttoOps/t3-codemode/blob/main/docs/adr/0001-usage-signal-for-pools.md)
 records why t3cm reads limits this way.
 
-`board.pool` covers `wf.launchTicket`, the launch box and the ask box. With it
-set, launches use the pool's model and effort (in a mixed pool, the picked
-member's), and the ask box runs that model in place of `askModel`. A
-`wf.launchTicket` call that asks for another model or effort fails. With a
-mixed pool, a call that names any model or effort fails, even one that matches
-a member's. Skills pick from a pool with [`wf.pick`](globals.md#wf).
+Board ticket launches and `wf.launchTicket` resolve their pool or model from
+the `models.ticket` slot first, checking repo `.t3-workflow.json` and
+`AGENTS.md` before user `~/.config/t3-workflow/config.json`, and fall back to
+legacy `board.pool` only when `models.ticket` is unset. `model` or `effort`
+passed to `wf.launchTicket` takes precedence over the slot and legacy board
+keys; passing `effort` alone over a mixed pool fails because members run
+different models. `board.pool` still covers the ask box, running the picked
+member's model in place of `askModel`. Skills pick from a pool with
+[`wf.pick`](globals.md#wf).
 The workflow skills do that for each launch when their `model worker` or
 `model ticket` slot names a pool, as `"worker": {"pool": "opus"}`; see
 [A pool on a model line](https://github.com/OttoOps/t3-codemode/blob/main/skills/t3-workflow/slots.md#a-pool-on-a-model-line).
